@@ -1,0 +1,4213 @@
+###  SECTION 1 - DATA PROCESSING ###
+
+# List of required CRAN packages
+cran_packages <- c("httr", "jsonlite", "ggplot2", "readr", "dplyr", "readxl","reshape2", "ggrepel", "sf", "rnaturalearth", "rnaturalearthdata", "devtools", "ggridges", "tidyr", "pheatmap", "patchwork", "igraph")
+
+# Install any missing CRAN packages
+installed <- cran_packages %in% rownames(installed.packages())
+if (any(!installed)) {
+  install.packages(cran_packages[!installed])
+}
+
+# Install rnaturalearthhires from GitHub
+if (!"rnaturalearthhires" %in% rownames(installed.packages())) {
+  devtools::install_github("ropensci/rnaturalearthhires")
+}
+
+# Load tidyverse-related packages
+library(readr); library(dplyr); library(tidyr); library(stringr)
+
+# Load visualization packages
+library(ggplot2); library(ggrepel); library(reshape2); library(viridis); library(viridisLite); library(ggridges); library(pheatmap); library(patchwork); library(cowplot) ; library(ggtext)
+
+# Load geospatial packages
+library(sf); library(rnaturalearth); library(rnaturalearthdata)
+
+# Load data handling and utility packages
+library(readxl); library(httr); library(jsonlite); library(gridExtra); library(grid)
+
+# Set working directory
+setwd("/Users/alexboudreau/Desktop")
+
+# Import files
+Penninsule <- read_csv("~/Desktop/Article/Pen.csv")
+Restigouche <- read_csv("~/Desktop/Article/Res.csv")
+Madawaska <- read_csv("~/Desktop/Article/Mad.csv")
+
+# Removal of non-essential columns in Penninsula dataframe
+Penninsule = subset(Penninsule, select = -c(1,3,4))
+
+# Removal of empty and/or incomplete rows
+Madawaska <- Madawaska[-(78:94),]
+Restigouche <- Restigouche [-(53:62),]
+Penninsule <- Penninsule[-c(2,10,17,22,39,42,56,62,65,66,69,76,77,82,86),]
+
+# Joining all three dataframes into one complete dataframe
+Results <- Madawaska %>%
+  full_join(Restigouche) %>%
+  full_join(Penninsule)
+
+# Extract gene names and version numbers
+Results$Gene_Name <- gsub("\\s*\\(NM_[0-9]+\\.[0-9]+\\)", "", Results$Gene)
+Results$Version <- as.numeric(gsub(".*\\(NM_[0-9]+\\.([0-9]+)\\)", "\\1", Results$Gene))
+
+# Find the latest version for each gene
+latest_versions <- aggregate(Version ~ Gene_Name, data = Results, max)
+
+# Merge the latest version back to the original data frame
+Results_merged <- merge(Results, latest_versions, by = "Gene_Name", all.x = TRUE)
+
+# Replace older versions with the latest version
+Results_merged$Gene <- with(Results_merged, paste(Gene_Name, "(NM_000018.", Version.y, ")", sep = ""))
+
+# Remove unnecessary columns
+Results_cleaned <- Results_merged[, c("Gene")]
+write.csv(Results_merged, "~/Desktop/Results_merged.csv", row.names = FALSE)
+
+# Manual insertion/curation of gnomAD results is done in the Results_Merged df at this point.
+
+
+# Read the data from the Excel file
+file_path <- "/Users/alexboudreau/Desktop/Article/DATA_done_VERIFIED.xlsx"
+df <- read_excel(file_path, sheet = 1)
+
+# Clean the column names
+colnames(df) <- c("Index", "Gene", "Base", "Protein", "Allele_count_gnomAD", "Allele_number_gnomAD", "Number_of_homozygotes", "Allele_frequency_gnomAD", "Mode_of_transmission", "Zygosity", "Associated_condition", "Frequency_Acadian", "Allele_Frequency")
+
+# Convert relevant columns to numeric, setting any problematic values to NA
+df <- df %>%
+  mutate(
+    Frequency_Acadian = as.numeric(Frequency_Acadian),
+    Allele_count_gnomAD = as.numeric(Allele_count_gnomAD),
+    Allele_number_gnomAD = as.numeric(Allele_number_gnomAD),
+    Allele_Frequency = as.numeric(Allele_Frequency),
+    Allele_frequency_gnomAD = as.numeric(Allele_frequency_gnomAD)
+  )
+
+# Remove rows with NA values in relevant columns
+df <- df %>% filter(!is.na(Frequency_Acadian) & !is.na(Allele_count_gnomAD) & !is.na(Allele_number_gnomAD))
+
+# Filter out rows with Allele_frequency_gnomAD equal to 0 to avoid division by zero
+filtered_df <- df %>%
+  filter(Allele_frequency_gnomAD != 0)
+
+# Calculate the allele frequency ratio
+filtered_df <- filtered_df %>%
+  mutate(allele_frequency_ratio = Allele_Frequency / Allele_frequency_gnomAD)
+
+# Get the top 20 genes with the highest allele frequency ratios
+top_genes <- filtered_df %>%
+  arrange(desc(allele_frequency_ratio)) %>%
+  head(20)
+
+# Calculate statistics for allele frequency ratios
+allele_freq_stats <- filtered_df %>%
+  summarise(
+    mean_ratio = mean(allele_frequency_ratio, na.rm = TRUE),
+    median_ratio = median(allele_frequency_ratio, na.rm = TRUE),
+    sd_ratio = sd(allele_frequency_ratio, na.rm = TRUE),
+    min_ratio = min(allele_frequency_ratio, na.rm = TRUE),
+    max_ratio = max(allele_frequency_ratio, na.rm = TRUE)
+  )
+
+# Group data by Gene and Base to get unique base counts
+unique_base_counts <- df %>%
+  group_by(Gene, Base) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  filter(Frequency_Acadian > 1) %>% # Exclude genes with a count of 1
+  arrange(Frequency_Acadian)
+
+# Get all gene counts without grouping by unique bases
+all_gene_counts <- df %>%
+  group_by(Gene) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  arrange(desc(Frequency_Acadian))  # Arranging in descending order
+
+### SECTION 2 - FISHER TESTING WITH MULTIPLE CORRECTION  ###
+
+# Function to perform one-tailed Fisher's exact test (alternative = "greater")
+fisher_test <- function(frequency_acadian, allele_count_gnomad, allele_number_gnomad) {
+  positive_acadian <- as.numeric(frequency_acadian)
+  negative_acadian <- 360 - as.numeric(frequency_acadian)
+  positive_gnomad <- as.numeric(allele_count_gnomad)
+  negative_gnomad <- as.numeric(allele_number_gnomad) - as.numeric(allele_count_gnomad)
+  
+  # Ensure all values are non-negative
+  if (positive_acadian < 0) positive_acadian <- 0
+  if (negative_acadian < 0) negative_acadian <- 0
+  if (positive_gnomad < 0) positive_gnomad <- 0
+  if (negative_gnomad < 0) negative_gnomad <- 0
+  
+  table <- matrix(c(positive_acadian, negative_acadian, positive_gnomad, negative_gnomad), nrow = 2)
+  test_result <- fisher.test(table, alternative = "greater")
+  return(test_result$p.value)
+}
+
+# Apply Fisher's test to each row
+df$p_value <- mapply(fisher_test, df$Frequency_Acadian, df$Allele_count_gnomAD, df$Allele_number_gnomAD)
+
+# Apply Bonferroni correction
+df$bonferroni_corrected_p <- p.adjust(df$p_value, method = "bonferroni")
+
+# Apply FDR correction
+df$fdr_corrected_p <- p.adjust(df$p_value, method = "BH")
+
+# Filter significant results for each type of p-value
+significant_fisher <- df %>% filter(p_value < 0.05)
+significant_bonferroni <- df %>% filter(bonferroni_corrected_p < 0.05)
+significant_fdr <- df %>% filter(fdr_corrected_p < 0.05)
+
+# Function to calculate Jeffreys confidence interval for binomial proportion
+calculate_jeffreys_ci <- function(x, n, alpha = 0.05) {
+  lower <- qbeta(alpha/2, x + 0.5, n - x + 0.5)
+  upper <- qbeta(1 - alpha/2, x + 0.5, n - x + 0.5)
+  return(c(lower = lower, upper = upper))
+}
+
+# Apply to the dataframe
+df <- df %>%
+  mutate(
+    # For Acadian data
+    ci_lower_acadian = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Frequency_Acadian[i], 360)[1]),
+    ci_upper_acadian = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Frequency_Acadian[i], 360)[2]),
+    
+    # For gnomAD data
+    ci_lower_gnomad = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Allele_count_gnomAD[i], df$Allele_number_gnomAD[i])[1]),
+    ci_upper_gnomad = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Allele_count_gnomAD[i], df$Allele_number_gnomAD[i])[2])
+  )
+
+# Create variant identifier combining Gene and Base change
+df <- df %>%
+  mutate(Variant = paste0(Gene, " ", Base))
+
+# Select the top 10 VARIANTS (not genes) based on p-value
+variants_to_plot <- df %>%
+  filter(p_value < 0.05) %>%  
+  arrange(p_value) %>%        
+  head(10) %>%                
+  pull(Variant)               
+
+# Create data for plotting confidence intervals - now with unique variants
+ci_plot_data <- df %>%
+  filter(Variant %in% variants_to_plot) %>%
+  dplyr::select(Variant, Gene, Base, Allele_Frequency, Allele_frequency_gnomAD, 
+                ci_lower_acadian, ci_upper_acadian, 
+                ci_lower_gnomad, ci_upper_gnomad, p_value) %>%
+  # Remove any duplicate rows
+  distinct() %>%
+  # Reorder variants by p-value for better visualization
+  arrange(p_value) %>%
+  mutate(Variant = factor(Variant, levels = Variant)) %>%
+  # Reshape to long format for easier plotting
+  pivot_longer(
+    cols = c(Allele_Frequency, Allele_frequency_gnomAD),
+    names_to = "Population",
+    values_to = "Frequency"
+  ) %>%
+  mutate(
+    Population = ifelse(Population == "Allele_Frequency", "Acadian", "gnomAD NFE"),
+    Lower_CI = ifelse(Population == "Acadian", ci_lower_acadian, ci_lower_gnomad),
+    Upper_CI = ifelse(Population == "Acadian", ci_upper_acadian, ci_upper_gnomad)
+  ) 
+
+# Define custom color palette
+custom_colors <- c("#FF6B6B", "#4ECDC4", "#45B7D1")
+
+# Use the first two colors for the populations in Panel A
+population_colors <- custom_colors[1:length(unique(ci_plot_data$Population))]
+
+# Panel A: Confidence interval plot with centered error bars - NOW BY VARIANT
+dodge_position <- position_dodge(width = 0.5)
+
+panel_a <- ggplot(ci_plot_data, aes(x = Variant, y = Frequency, color = Population)) +
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI, color = Population), 
+                position = dodge_position, width = 0.2, linewidth = 0.8, 
+                show.legend = FALSE) +
+  geom_point(position = dodge_position, size = 3) +
+  coord_flip() +
+  labs(x = "Variant",
+       y = "Allele Frequency") +
+  scale_color_manual(values = population_colors) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 16, color = "black", face = "bold"),
+    axis.title.y = element_text(size = 16, color = "black", face = "bold"),
+    axis.text.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 15, color = "black", face = "bold"),
+    legend.text = element_text(size = 14, color = "black", face = "bold"),
+    legend.position = "bottom",
+    legend.margin = margin(t = 15, b = 5, l = 5, r = 5),  
+    legend.box.margin = margin(t = 10, b = 10, l = 10, r = 10),  
+    legend.box.spacing = unit(0.5, "cm"), 
+    legend.key.width = unit(1.2, "cm"), 
+    legend.key.height = unit(0.5, "cm"),  
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(t = 20, r = 20, b = 20, l = 20),  
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.15, "cm")
+  ) +
+  guides(color = guide_legend(
+    title.position = "top",  
+    title.hjust = 0.5,      
+    label.position = "right",
+    byrow = TRUE,            
+    override.aes = list(size = 3)  
+  ))
+
+# Calculate the Bonferroni significance threshold
+total_variants_tested <- nrow(df)
+bonferroni_threshold <- 0.05 / total_variants_tested
+neg_log10_threshold <- -log10(bonferroni_threshold)
+
+# Panel B: Using expression() for proper mathematical notation
+panel_b <- ggplot(df, aes(x = Allele_Frequency, y = -log10(p_value))) +
+  xlim(0, 0.013) +  
+  # Plot all variants as gray points
+  geom_point(color = "gray70", alpha = 0.7, size = 2) +
+  # Highlight significant variants with custom color gradient
+  geom_point(data = df %>% filter(bonferroni_corrected_p < 0.05 & !is.na(Allele_Frequency) & Allele_Frequency <= 0.013), 
+             aes(color = -log10(p_value)), size = 3) +
+  # Custom color gradient: red for highest -log10(p) values (lowest p-values)
+  scale_color_gradient(low = custom_colors[2], high = custom_colors[1], 
+                       name = bquote(bold(-log[bold("10")]("p-value")))) +
+  # Add labels to significant variants
+  geom_text_repel(
+    data = df %>% filter(bonferroni_corrected_p < 0.05 & !is.na(Allele_Frequency) & Allele_Frequency <= 0.013),
+    aes(label = Gene),
+    size = 4,
+    max.overlaps = 30,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    fontface = "bold",
+    force = 2,
+    seed = 123
+  )+
+  # Add horizontal line for Bonferroni significance threshold
+  geom_hline(yintercept = neg_log10_threshold, linetype = "dashed", 
+             color = "red", linewidth = 0.8) +
+  # Add annotation for the threshold
+  annotate("text", x = max(df$Allele_Frequency, na.rm = TRUE) * 0.95, 
+           y = neg_log10_threshold * 1.15, 
+           label = paste("Bonferroni\nthreshold"), 
+           color = "red", hjust = 1, size = 4.5, fontface = "italic") +
+  labs(x = "Allele Frequency",
+       y = bquote(bold(-log[bold("10")]("p-value")))) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 16, color = "black", face = "bold"),
+    axis.title.y = element_text(size = 16, color = "black", face = "bold"),
+    axis.text.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 15, color = "black", face = "bold"),
+    legend.text = element_text(size = 14, color = "black", face = "bold"),
+    legend.position = "bottom",
+    legend.margin = margin(t = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(t = 20, r = 20, b = 10, l = 20),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.15, "cm")
+  )
+
+# Create the final multiplot with proper spacing and external labels
+publication_multiplot <- arrangeGrob(
+  panel_a,
+  panel_b,
+  ncol = 1,
+  nrow = 2,
+  heights = c(1, 1),
+  padding = unit(0, "cm")  
+)
+
+# Add panel labels OUTSIDE the plots at the top-left
+publication_multiplot_labeled <- arrangeGrob(
+  publication_multiplot,
+  top = textGrob("", gp = gpar(fontsize = 1)),  # Empty space at top
+  left = textGrob("", gp = gpar(fontsize = 1))   # Empty space at left
+)
+
+# Create a custom layout with labels
+final_plot <- grid.arrange(
+  textGrob("A", x = 0.02, y = 0.98, just = c("left", "top"), 
+           gp = gpar(fontsize = 20, fontface = "bold")),
+  textGrob("B", x = 0.02, y = 0.98, just = c("left", "top"), 
+           gp = gpar(fontsize = 20, fontface = "bold")),
+  publication_multiplot,
+  layout_matrix = rbind(c(1, 3),
+                        c(2, 3)),
+  widths = c(0.03, 0.97),
+  heights = c(0.5, 0.5)
+)
+
+# Save the plot
+ggsave("genetic_variants_multiplot.png", 
+       plot = final_plot,
+       width = 10,        
+       height = 12,
+       dpi = 600,
+       bg = "white")
+
+### SECTION  3 - VARIANT ALLELE COUNT VISUALIZATION  ### 
+# Group data by Gene and Base to get unique base counts
+unique_base_counts <- df %>%
+  group_by(Gene, Base) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  arrange(Frequency_Acadian)
+
+# Plot with new color scheme
+plot_unique_base_counts <- ggplot(unique_base_counts, 
+                                  aes(x = reorder(Gene, -Frequency_Acadian), 
+                                      y = Frequency_Acadian, 
+                                      fill = Frequency_Acadian)) +
+  geom_bar(stat = "identity", width = 0.8) +
+  coord_flip() +
+  scale_fill_gradient2(low = "#FF6B6B", 
+                       mid = "#4ECDC4", 
+                       high = "#45B7D1",
+                       midpoint = median(unique_base_counts$Frequency_Acadian),
+                       guide = "none") +
+  scale_y_continuous(expand = c(0, 0), 
+                     breaks = scales::pretty_breaks(n = 6)) +
+  labs(x = "Gene",
+       y = "Variant allele count") +
+  theme_minimal(base_size = 11, base_family = "sans") +  
+  theme(
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    
+    axis.title.x = element_text(size = 12, color = "black", face = "bold", margin = margin(t = 8)),
+    axis.title.y = element_text(size = 12, color = "black", face = "bold", margin = margin(r = 8)),
+    axis.text.x = element_text(size = 10, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 9, color = "black", face = "bold"),
+    
+    legend.position = "none",
+    
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.grid.major.x = element_line(color = "grey90", size = 0.3),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    
+    axis.line.x = element_line(color = "black", size = 0.4),
+    axis.line.y = element_blank(),
+    axis.ticks.x = element_line(color = "black", size = 0.4),
+    axis.ticks.y = element_blank(),
+    axis.ticks.length = unit(0.15, "cm"),
+    
+    plot.margin = unit(c(0.3, 0.3, 0.3, 0.3), "cm")
+  )
+
+# Calculate dynamic dimensions
+gene_count <- nrow(unique_base_counts)
+plot_height <- max(6, gene_count * 0.15) 
+plot_width <- 8
+
+# Save high-resolution plot
+ggsave("publication_unique_base_counts.png", 
+       plot = plot_unique_base_counts,
+       width = plot_width, 
+       height = plot_height, 
+       dpi = 600,  
+       units = "in",
+       bg = "white",
+       limitsize = FALSE)
+
+# Print the data
+print(plot_unique_base_counts)
+
+### SECTION 4 - GENE EXPRESSION BY REGION VISUALIZATION ###
+
+# Add region identifier columns to each dataframe before joining
+Penninsule$region <- "Pen"  # Acadian Peninsula
+Restigouche$region <- "Res" # Restigouche
+Madawaska$region <- "Mad"   # Madawaska
+
+# Joining all three dataframes into one complete dataframe
+Results <- bind_rows(Madawaska, Restigouche, Penninsule)
+
+# Extract gene names and version numbers
+Results$Gene_Name <- gsub("\\s*\\(NM_[0-9]+\\.[0-9]+\\)", "", Results$Gene)
+Results$Version <- as.numeric(gsub(".*\\(NM_[0-9]+\\.([0-9]+)\\)", "\\1", Results$Gene))
+
+# Find the latest version for each gene
+latest_versions <- aggregate(Version ~ Gene_Name, data = Results, max)
+
+# Merge the latest version back to the original data frame
+Results_merged <- merge(Results, latest_versions, by = "Gene_Name", all.x = TRUE)
+
+# Replace older versions with the latest version
+Results_merged$Gene <- with(Results_merged, paste(Gene_Name, "(NM_000018.", Version.y, ")", sep = ""))
+
+# Keep only necessary columns including region information
+Results_cleaned <- Results_merged[, c("Gene", "Gene_Name", "region", "Base", "proteine")]
+
+# Export the merged data with region information
+write.csv(Results_merged, "~/Desktop/Results_merged_with_regions.csv", row.names = FALSE)
+
+#Theme with large fonts and no titles
+publication_theme <- theme_minimal() +
+  theme(
+    # Larger base font sizes for readability at print scale
+    text = element_text(size = 14, family = "Arial"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    legend.title = element_text(size = 13, face = "bold", color = "black"),
+    legend.text = element_text(size = 12, color = "black"),
+    
+    # Clean panel appearance
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.background = element_rect(fill = "white"),
+    
+    # Remove titles for publication
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    
+    # Clean legend with padding
+    legend.position = "right",
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    legend.key = element_rect(fill = "white"),
+    legend.margin = margin(t = 10, r = 10, b = 10, l = 15), 
+    legend.box.margin = margin(t = 5, r = 5, b = 5, l = 5),  
+    legend.key.width = unit(1.2, "cm"),   
+    legend.key.height = unit(0.6, "cm"),  
+    
+    # Margins for proper spacing
+    plot.margin = margin(10, 10, 10, 10, "pt"),
+    
+    # Axis appearance
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.2, "cm")
+  )
+
+# Define custom color palette
+custom_colors <- c("#FF6B6B", "#4ECDC4", "#45B7D1")
+
+# Create a mapping from abbreviated to full region names
+region_names <- c(
+  "Pen" = "Acadian Peninsula",
+  "Res" = "Restigouche",
+  "Mad" = "Madawaska"
+)
+
+# Add full region names to the dataframe, clean gene names, and remove NA genes
+Results_full <- Results_cleaned %>%
+  mutate(region_full = region_names[region]) %>%
+  # Clean gene names by removing NM identifiers and extract just the gene symbol
+  mutate(Gene_clean = case_when(
+    is.na(Gene) | Gene == "NA" ~ NA_character_,
+    grepl("\\(NM_", Gene) ~ str_extract(Gene, "^[^(]+"),  # Extract part before (NM_)
+    TRUE ~ Gene
+  )) %>%
+  filter(!is.na(Gene_clean) & Gene_clean != "NA" & Gene_clean != "")  # Remove NA values and empty strings
+
+# 1. Horizontal Stacked Bar Chart - Panel A
+top_genes <- Results_full %>%
+  count(Gene_clean) %>%
+  arrange(desc(n)) %>%
+  head(12) %>%  
+  pull(Gene_clean)
+
+top_gene_data <- Results_full %>%
+  filter(Gene_clean %in% top_genes) %>%
+  group_by(Gene_clean, region_full) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Gene_clean) %>%
+  mutate(total = sum(count),
+         percentage = count / total * 100) %>%
+  arrange(desc(total), Gene_clean)
+
+# Panel A - Horizontal stacked bar chart with custom colors
+p1 <- ggplot(top_gene_data, aes(x = count, y = reorder(Gene_clean, total), fill = region_full)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +
+  scale_fill_manual(values = custom_colors, name = "Region") +
+  scale_x_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 5)) +
+  labs(
+    x = "Variant allele count",
+    y = "Gene"
+  ) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    legend.margin = margin(t = 15, r = 15, b = 15, l = 20),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.key.width = unit(1.5, "cm"),   
+    legend.key.height = unit(0.8, "cm"), 
+    legend.spacing.y = unit(0.3, "cm"),  
+    plot.margin = margin(25, 25, 10, 10, "pt")  
+  ) +
+  guides(fill = guide_legend(
+    title.position = "top",     
+    title.hjust = 0.5,          
+    label.position = "right",  
+    byrow = TRUE,              
+    override.aes = list(size = 1.2)  
+  ))
+
+print(p1)
+
+# 2. Ridge Plot - Panel B
+region_profiles <- Results_full %>%
+  group_by(region_full, Gene_clean) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(region_full) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+p2 <- ggplot(region_profiles, aes(x = proportion, y = region_full, fill = region_full)) +
+  geom_density_ridges(scale = 1.5, alpha = 0.8, bandwidth = 0.003) +
+  scale_fill_manual(values = custom_colors) +
+  scale_x_continuous(expand = c(0.01, 0), limits = c(0, 0.15), 
+                     breaks = seq(0, 0.15, 0.03)) +
+  labs(
+    x = "Proportion of total regional expression",
+    y = "Region"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14, family = "Arial"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(color = "gray90", linewidth = 0.3),
+    panel.grid.major.y = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    plot.margin = margin(25, 10, 10, 10, "pt") 
+  )
+
+# 3. Bubble Plot - Panel C
+gene_variation <- Results_full %>%
+  group_by(Gene_clean, region_full) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = region_full, values_from = count, values_fill = 0) %>%
+  rowwise() %>%
+  mutate(
+    total = sum(c_across(where(is.numeric))),
+    variation = sd(c_across(where(is.numeric))) / (mean(c_across(where(is.numeric))) + 0.1)
+  ) %>%
+  ungroup() %>%
+  arrange(desc(variation)) %>%
+  head(12)
+
+region_columns <- c("Acadian Peninsula", "Madawaska", "Restigouche")
+
+bubble_data <- gene_variation %>%
+  pivot_longer(
+    cols = all_of(region_columns), 
+    names_to = "region_full",
+    values_to = "count"
+  ) %>%
+  mutate(proportion = count / total)
+
+# Create a custom color gradient using your colors
+custom_gradient <- colorRampPalette(c("#45B7D1", "#4ECDC4", "#FF6B6B"))(100)
+
+p3 <- ggplot(bubble_data, aes(x = region_full, y = reorder(Gene_clean, -variation), 
+                              size = count, color = proportion)) +
+  geom_point(alpha = 0.85, stroke = 0.5) +
+  scale_size_continuous(range = c(2, 10), breaks = c(1, 5, 10, 15), 
+                        name = "Count", guide = guide_legend(override.aes = list(alpha = 1))) +
+  scale_color_gradientn(colors = custom_gradient, name = "Proportion",
+                        guide = guide_colorbar(barwidth = 1.2, barheight = 8)) +
+  scale_x_discrete(expand = c(0.1, 0.1)) +
+  labs(
+    x = "Region",
+    y = "Gene"
+  ) +
+  publication_theme +
+  theme(
+    panel.grid.major = element_line(color = "gray95", linewidth = 0.3),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    legend.box = "horizontal",
+    legend.position = "bottom",
+    legend.margin = margin(t = 20, r = 10, b = 15, l = 10),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.box.spacing = unit(1, "cm"),     
+    legend.key.width = unit(1.5, "cm"),     
+    legend.key.height = unit(0.8, "cm"),   
+    legend.spacing.x = unit(0.8, "cm"),     
+    plot.margin = margin(25, 10, 20, 10, "pt")  
+  ) +
+  guides(
+    size = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      label.position = "bottom",
+      override.aes = list(alpha = 1),
+      keywidth = unit(1.2, "cm"),
+      keyheight = unit(0.8, "cm")
+    ),
+    color = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = unit(3, "cm"),    
+      barheight = unit(0.8, "cm"), 
+      label.position = "bottom"
+    )
+  )
+
+# Panel label function to position label above the plot
+add_panel_label <- function(plot, label) {
+  plot + 
+    annotation_custom(
+      grob = grid::textGrob(label, x = 0.02, y = 1.05,  # Position above plot (y > 1)
+                            gp = grid::gpar(fontsize = 16, fontface = "bold")),
+      xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf
+    ) +
+    coord_cartesian(clip = "off")  
+}
+
+# Add panel labels
+p1_labeled <- add_panel_label(p1, "A")
+p2_labeled <- add_panel_label(p2, "B") 
+p3_labeled <- add_panel_label(p3, "C")
+
+# Create combined figure
+combined_figure <- p1_labeled / p2_labeled / p3_labeled + 
+  plot_layout(heights = c(1, 0.6, 1.2))
+
+# Save high-resolution figures
+ggsave(
+  "gene_expression_by_region_publication.png", 
+  combined_figure, 
+  width = 8.5,    
+  height = 14,    
+  dpi = 600
+)
+
+# Individual panels for submission
+ggsave("panel_A_gene_distribution.png", p1_labeled, 
+       width = 8.5, height = 4, dpi = 600)
+
+ggsave("panel_B_expression_profiles.png", p2_labeled, 
+       width = 8.5, height = 3, dpi = 600)
+
+ggsave("panel_C_bubble_plot.png", p3_labeled, 
+       width = 8.5, height = 5, dpi = 600)
+
+### SECTION 5 - REGIONAL HEALTH ZONES MAP AND SIGNIFICANT GENES SCATTERPLOT ###
+
+# Define color palettes
+zone_levels <- as.character(1:7)
+zone_palette <- setNames(c("white", "white", "white", "grey70", "grey70", "grey70", "white"), zone_levels)
+province_levels <- c("NB", "NL", "NS", "PE", "QC")
+province_palette <- setNames(c("grey90", "white", "white", "white", "white"), province_levels)
+
+# Get Canada map data
+canada <- ne_states(country = "canada", returnclass = "sf")
+relevant_provinces <- c("New Brunswick", "Nova Scotia", "Prince Edward Island", 
+                        "Québec", "Newfoundland and Labrador")
+main_map_data <- canada %>% 
+  filter(name %in% relevant_provinces)
+new_brunswick <- canada %>% 
+  filter(name == "New Brunswick")
+
+# Read NB health regions
+nb_health_regions <- st_read("/Users/alexboudreau/Downloads/geonb_hr-rs_shp/NBDOH_HealthRegions_Jan2023.shp")
+nb_health_regions <- st_transform(nb_health_regions, st_crs(new_brunswick))
+
+# Points data
+points <- data.frame(
+  name = c("Restigouche", "Peninsula", "Madawaska"),
+  longitude = c(-66.5, -64.9, -68.3),  
+  latitude = c(48.0, 47.7, 47.4),
+  n_value = c("n=60", "n=60", "n=60")
+)
+points_sf <- st_as_sf(points, coords = c("longitude", "latitude"), 
+                      crs = st_crs(new_brunswick))
+
+# Main map 
+main_map <- ggplot() +
+  geom_sf(data = main_map_data, aes(fill = postal), color = "black", size = 0.5) +
+  scale_fill_manual(values = province_palette, name = "") +
+  geom_sf(data = filter(main_map_data, name == "New Brunswick"), 
+          fill = NA, color = "black", linewidth = 1.5) +  # Black border for NB
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.margin = margin(10, 10, 10, 10),
+    text = element_text(size = 24, color = "black", face = "bold")  # Increased from 18 to 24
+  )
+
+# Inset map 
+inset_map <- ggplot() +
+  geom_sf(data = new_brunswick, fill = "white", color = "black", size = 0.5) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.8, size = 0.5) +
+  scale_fill_manual(values = zone_palette, name = "Zone") +
+  geom_sf(data = points_sf, color = "black", size = 4) +  
+  geom_segment(data = points_sf, 
+               aes(x = st_coordinates(geometry)[,1], 
+                   y = st_coordinates(geometry)[,2],
+                   xend = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                   yend = st_coordinates(geometry)[,2] + c(0.3, 0.3, 0.3)),
+               linewidth = 0.8, color = "black") +  
+  geom_text(data = points_sf, 
+            aes(x = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                y = st_coordinates(geometry)[,2] + c(0.3, 0.3, 0.3),
+                label = name),
+            size = 8,  # Increased from 6 to 8
+            hjust = c(0, 0, 1),
+            fontface = "bold") +
+  geom_text(data = points_sf, 
+            aes(x = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                y = st_coordinates(geometry)[,2] + c(0.15, 0.15, 0.15),
+                label = n_value),
+            size = 7,  # Increased from 5 to 7
+            hjust = c(0, 0, 1),
+            fontface = "bold") +
+  theme_void() +
+  coord_sf(clip = "off") +
+  theme(
+    legend.position = "none",
+    plot.margin = margin(10, 10, 10, 10),
+    text = element_text(size = 24, color = "black", face = "bold")  # Increased from 18 to 24
+  )
+
+# Combine maps
+map_combined <- plot_grid(
+  main_map, inset_map,
+  ncol = 2,
+  rel_widths = c(1.3, 1),
+  align = "h"
+)
+
+# Add connection lines 
+panel_a <- ggdraw(map_combined) +
+  draw_line(x = c(0.30, 0.62), y = c(0.26, 0.95),  # Top connection line
+            color = "black", linetype = "dashed", size = 1) +
+  draw_line(x = c(0.31, 0.62), y = c(0.19, 0.25),  # Bottom connection line
+            color = "black", linetype = "dashed", size = 1)
+
+# Prepare scatterplot data 
+scatter_data <- df %>%
+  group_by(Gene, Base) %>%
+  summarise(gene_frequency = sum(Frequency_Acadian), .groups = 'drop') %>%
+  group_by(Gene) %>%
+  summarise(
+    allele_count = sum(gene_frequency),
+    unique_variants = n(),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    category = case_when(
+      allele_count > 3 | unique_variants > 2 ~ "Above threshold",
+      TRUE ~ "Below threshold"
+    ),
+    show_label = allele_count > 3 | unique_variants > 2
+  )
+
+# Create scatterplot with legend in top right corner
+panel_b <- ggplot(scatter_data, aes(x = allele_count, y = unique_variants)) +
+  geom_point(aes(color = category, size = category), alpha = 0.8, 
+             position = position_jitter(width = 0.1, height = 0.1)) +
+  ggrepel::geom_text_repel(
+    data = filter(scatter_data, show_label),
+    aes(label = Gene),
+    size = 6,  
+    box.padding = 0.8,
+    point.padding = 0.5,
+    segment.color = "gray30",
+    segment.size = 0.6,
+    max.overlaps = 15,
+    force = 3,
+    fontface = "bold"
+  ) +
+  scale_color_manual(
+    values = c("Below threshold" = "grey50", 
+               "Above threshold" = "black"),
+    name = "",
+    labels = c("≤3 alleles AND ≤2 variants", ">3 alleles OR >2 variants")  # Changed "mutations" to "variants"
+  ) +
+  scale_size_manual(
+    values = c("Below threshold" = 4, 
+               "Above threshold" = 6),
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 6),
+    expand = c(0.05, 0.05)
+  ) +
+  scale_y_continuous(
+    breaks = function(x) seq(floor(min(x)), ceiling(max(x)), by = 1),
+    expand = c(0.05, 0.05)
+  ) +
+  labs(
+    x = "Allele Count",
+    y = "Number of Unique Variants"  # Changed "Mutations" to "Variants"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(size = 20, color = "black", face = "bold"),  
+    axis.text = element_text(size = 18, color = "black", face = "bold"),  
+    axis.title = element_text(size = 22, color = "black", face = "bold"), 
+    legend.position = c(0.98, 0.98),  # Top right corner
+    legend.justification = c(1, 1),   # Anchor at top right
+    legend.text = element_text(size = 20, face = "bold"),  # Increased from 16 to 20
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.8),  # Box around legend
+    legend.margin = margin(t = 5, r = 5, b = 5, l = 5),
+    legend.box.margin = margin(0, 0, 0, 0),
+    panel.border = element_rect(color = "black", fill = NA, size = 1.2),
+    axis.line = element_blank(),
+    plot.margin = margin(15, 15, 15, 15)
+  ) +
+  geom_vline(xintercept = 3, linetype = "dashed", color = "gray40", alpha = 0.8, size = 0.8) + 
+  geom_hline(yintercept = 2, linetype = "dashed", color = "gray40", alpha = 0.8, size = 0.8)
+
+# Create final vertical two-panel figure 
+final_figure_vertical <- plot_grid(
+  panel_a, panel_b,
+  ncol = 1,
+  rel_heights = c(1, 1.2),
+  labels = c("A", "B"),
+  label_size = 36, 
+  label_fontface = "bold",
+  hjust = -0.1,
+  vjust = 1.1
+)
+
+# Save the figure 
+ggsave("publication_figure_two_panel_vertical_simplified.png", 
+       final_figure_vertical, 
+       width = 18,
+       height = 16,
+       dpi = 600,
+       bg = "white")
+
+# Display the figure
+print(final_figure_vertical)
+
+
+
+
+
+
+
+
+
+
+
+
+
+### SECTION 6 - INDIVIDUAL VARIANT BURDEN ANALYSIS (CORRECTED) ###
+
+# Reload and prepare the original data with patient IDs
+Penninsule_raw <- read_csv("~/Desktop/Article/Pen.csv")
+Restigouche_raw <- read_csv("~/Desktop/Article/Res.csv")
+Madawaska_raw <- read_csv("~/Desktop/Article/Mad.csv")
+
+# Add region identifiers
+Penninsule_raw$region <- "Pen"
+Restigouche_raw$region <- "Res"
+Madawaska_raw$region <- "Mad"
+
+# Combine all data
+all_patient_data <- bind_rows(Madawaska_raw, Restigouche_raw, Penninsule_raw)
+
+# Clean gene names
+all_patient_data <- all_patient_data %>%
+  mutate(Gene_clean = gsub("\\s*\\(NM_[0-9]+\\.[0-9]+\\)", "", Gene))
+
+# Count variants per individual
+variants_per_individual <- all_patient_data %>%
+  group_by(Code) %>%
+  summarise(
+    n_variants = n(),
+    n_genes = n_distinct(Gene_clean),
+    region = first(region),
+    .groups = 'drop'
+  )
+
+# Get total number of unique individuals
+total_individuals <- n_distinct(all_patient_data$Code)
+
+# Identify individuals with NO variants (non-carriers)
+# Assuming you had 180 total individuals and these files represent carriers
+n_total_study <- 180
+n_carriers <- total_individuals
+n_non_carriers <- n_total_study - n_carriers
+
+# Create complete dataset including non-carriers
+if (n_non_carriers > 0) {
+  non_carriers_df <- data.frame(
+    Code = paste0("NonCarrier_", 1:n_non_carriers),
+    n_variants = 0,
+    n_genes = 0,
+    region = NA
+  )
+  
+  variants_per_individual_complete <- bind_rows(
+    variants_per_individual,
+    non_carriers_df
+  )
+} else {
+  variants_per_individual_complete <- variants_per_individual
+}
+
+# Calculate summary statistics for variants
+variant_stats <- variants_per_individual_complete %>%
+  summarise(
+    n_individuals = n(),
+    n_carriers = sum(n_variants > 0),
+    n_non_carriers = sum(n_variants == 0),
+    mean_variants = mean(n_variants),
+    median_variants = median(n_variants),
+    sd_variants = sd(n_variants),
+    min_variants = min(n_variants),
+    max_variants = max(n_variants),
+    # 95% CI
+    ci_lower = mean(n_variants) - qt(0.975, n() - 1) * sd(n_variants) / sqrt(n()),
+    ci_upper = mean(n_variants) + qt(0.975, n() - 1) * sd(n_variants) / sqrt(n()),
+    # Percentiles
+    p25 = quantile(n_variants, 0.25),
+    p75 = quantile(n_variants, 0.75),
+    p90 = quantile(n_variants, 0.90),
+    p95 = quantile(n_variants, 0.95)
+  )
+
+# Calculate summary statistics for genes
+gene_stats <- variants_per_individual_complete %>%
+  summarise(
+    mean_genes = mean(n_genes),
+    median_genes = median(n_genes),
+    sd_genes = sd(n_genes),
+    min_genes = min(n_genes),
+    max_genes = max(n_genes),
+    # 95% CI
+    ci_lower = mean(n_genes) - qt(0.975, n() - 1) * sd(n_genes) / sqrt(n()),
+    ci_upper = mean(n_genes) + qt(0.975, n() - 1) * sd(n_genes) / sqrt(n())
+  )
+
+# Print comprehensive summary
+cat("\n╔══════════════════════════════════════════════════════════════╗\n")
+cat("║     PLP VARIANT BURDEN PER INDIVIDUAL - FINAL RESULTS       ║\n")
+cat("╚══════════════════════════════════════════════════════════════╝\n\n")
+
+cat("COHORT OVERVIEW:\n")
+cat("─────────────────────────────────────────────────────────────\n")
+cat(sprintf("Total individuals in study: %d\n", variant_stats$n_individuals))
+cat(sprintf("Carriers (≥1 PLP variant): %d (%.1f%%)\n", 
+            variant_stats$n_carriers, 
+            variant_stats$n_carriers/variant_stats$n_individuals*100))
+cat(sprintf("Non-carriers: %d (%.1f%%)\n\n", 
+            variant_stats$n_non_carriers,
+            variant_stats$n_non_carriers/variant_stats$n_individuals*100))
+
+cat("PLP VARIANTS PER INDIVIDUAL:\n")
+cat("─────────────────────────────────────────────────────────────\n")
+cat(sprintf("Mean: %.2f variants (95%% CI: %.2f - %.2f)\n", 
+            variant_stats$mean_variants, 
+            variant_stats$ci_lower, 
+            variant_stats$ci_upper))
+cat(sprintf("Median: %.0f variant(s)\n", variant_stats$median_variants))
+cat(sprintf("Range: %d to %d variants per individual\n", 
+            variant_stats$min_variants, 
+            variant_stats$max_variants))
+cat(sprintf("Interquartile range (IQR): %.0f to %.0f variants\n", 
+            variant_stats$p25, 
+            variant_stats$p75))
+cat(sprintf("90th percentile: %.0f variants\n", variant_stats$p90))
+cat(sprintf("95th percentile: %.0f variants\n\n", variant_stats$p95))
+
+cat("GENES AFFECTED PER INDIVIDUAL:\n")
+cat("─────────────────────────────────────────────────────────────\n")
+cat(sprintf("Mean: %.2f genes (95%% CI: %.2f - %.2f)\n", 
+            gene_stats$mean_genes, 
+            gene_stats$ci_lower, 
+            gene_stats$ci_upper))
+cat(sprintf("Median: %.0f gene(s)\n", gene_stats$median_genes))
+cat(sprintf("Range: %d to %d genes per individual\n\n", 
+            gene_stats$min_genes, 
+            gene_stats$max_genes))
+
+# Distribution table
+cat("DISTRIBUTION OF VARIANT BURDEN:\n")
+cat("─────────────────────────────────────────────────────────────\n")
+variant_distribution <- variants_per_individual_complete %>%
+  count(n_variants) %>%
+  mutate(
+    percentage = n / sum(n) * 100,
+    cumulative = cumsum(percentage)
+  ) %>%
+  arrange(n_variants)
+
+print(variant_distribution, n = Inf)
+
+# Create enhanced visualization INCLUDING non-carriers at x=0
+p_individual_burden <- ggplot(variants_per_individual_complete, 
+                              aes(x = n_variants)) +
+  geom_histogram(binwidth = 1, fill = custom_colors[2], color = "black", 
+                 alpha = 0.8, linewidth = 0.5) +
+  geom_vline(xintercept = variant_stats$mean_variants, 
+             linetype = "dashed", color = custom_colors[1], linewidth = 1.2) +
+  geom_vline(xintercept = variant_stats$median_variants, 
+             linetype = "dotted", color = custom_colors[3], linewidth = 1.2) +
+  annotate("text", 
+           x = variant_stats$mean_variants + 0.3, 
+           y = Inf, 
+           label = sprintf("Mean = %.2f", variant_stats$mean_variants),
+           vjust = 2, hjust = 0, size = 5, fontface = "bold", 
+           color = custom_colors[1]) +
+  annotate("text", 
+           x = variant_stats$median_variants + 0.3, 
+           y = Inf, 
+           label = sprintf("Median = %.0f", variant_stats$median_variants),
+           vjust = 4, hjust = 0, size = 5, fontface = "bold", 
+           color = custom_colors[3]) +
+  scale_x_continuous(breaks = seq(0, max(variants_per_individual_complete$n_variants), 
+                                  by = 1),
+                     limits = c(-0.5, max(variants_per_individual_complete$n_variants) + 0.5)) +  # Include 0
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    x = "Number of PLP Variants per Individual",
+    y = "Number of Individuals",
+    title = "Distribution of Pathogenic Variant Burden Across Cohort"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.x = element_text(size = 12, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 12, color = "black", face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(t = 20, r = 20, b = 20, l = 20),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.5)
+  )
+
+# Save the plot
+ggsave("individual_variant_burden_distribution.png", 
+       plot = p_individual_burden,
+       width = 10,
+       height = 6,
+       dpi = 600,
+       bg = "white")
+
+print(p_individual_burden)
+
+# Create summary table for manuscript
+manuscript_summary <- data.frame(
+  Metric = c(
+    "Total individuals",
+    "Carriers (≥1 PLP variant)",
+    "Non-carriers",
+    "Mean PLP variants per individual (95% CI)",
+    "Median PLP variants",
+    "Range of PLP variants per individual",
+    "Interquartile range",
+    "Mean genes affected per individual (95% CI)",
+    "Range of genes affected per individual"
+  ),
+  Value = c(
+    sprintf("%d", variant_stats$n_individuals),
+    sprintf("%d (%.1f%%)", variant_stats$n_carriers, 
+            variant_stats$n_carriers/variant_stats$n_individuals*100),
+    sprintf("%d (%.1f%%)", variant_stats$n_non_carriers,
+            variant_stats$n_non_carriers/variant_stats$n_individuals*100),
+    sprintf("%.2f (%.2f - %.2f)", variant_stats$mean_variants, 
+            variant_stats$ci_lower, variant_stats$ci_upper),
+    sprintf("%.0f", variant_stats$median_variants),
+    sprintf("%d to %d", variant_stats$min_variants, variant_stats$max_variants),
+    sprintf("%.0f to %.0f", variant_stats$p25, variant_stats$p75),
+    sprintf("%.2f (%.2f - %.2f)", gene_stats$mean_genes,
+            gene_stats$ci_lower, gene_stats$ci_upper),
+    sprintf("%d to %d", gene_stats$min_genes, gene_stats$max_genes)
+  )
+)
+
+# Save outputs
+write.csv(manuscript_summary, "individual_variant_burden_summary.csv", row.names = FALSE)
+write.csv(variants_per_individual_complete, "individual_variant_counts.csv", row.names = FALSE)
+write.csv(variant_distribution, "variant_burden_distribution.csv", row.names = FALSE)
+
+# Print table
+cat("\n\nMANUSCRIPT SUMMARY TABLE:\n")
+cat("═════════════════════════════════════════════════════════════\n")
+print(manuscript_summary, row.names = FALSE)
+
+cat("\n\n📝 SUGGESTED MANUSCRIPT TEXT:\n")
+cat("═════════════════════════════════════════════════════════════\n")
+cat(sprintf("Extended carrier screening revealed a high burden of carrier status\n"))
+cat(sprintf("across the cohort. Among the %d patients, %d (%.1f%%) carried at least\n",
+            variant_stats$n_individuals, variant_stats$n_carriers,
+            variant_stats$n_carriers/variant_stats$n_individuals*100))
+cat(sprintf("one pathogenic or likely pathogenic (PLP) variant, whereas only %d (%.1f%%)\n",
+            variant_stats$n_non_carriers,
+            variant_stats$n_non_carriers/variant_stats$n_individuals*100))
+cat(sprintf("were non-carriers. On average, individuals carried %.2f PLP variants\n",
+            variant_stats$mean_variants))
+cat(sprintf("(95%% CI: %.2f-%.2f) affecting %.2f genes (95%% CI: %.2f-%.2f), ranging\n",
+            variant_stats$ci_lower, variant_stats$ci_upper,
+            gene_stats$mean_genes, gene_stats$ci_lower, gene_stats$ci_upper))
+cat(sprintf("from %d to %d variants per individual. In total, variants were distributed\n",
+            variant_stats$min_variants, variant_stats$max_variants))
+cat(sprintf("across 88 distinct genes.\n"))
+cat("═════════════════════════════════════════════════════════════\n\n")
+
+
+
+
+# Check for potential non-carriers in the original data
+cat("=== Checking for empty/NA entries ===\n\n")
+
+# Check Penninsule
+pen_check <- Penninsule_raw %>%
+  filter(is.na(Gene) | Gene == "" | is.na(Base) | Base == "")
+cat("Penninsule - rows with empty Gene/Base:", nrow(pen_check), "\n")
+
+# Check Restigouche  
+res_check <- Restigouche_raw %>%
+  filter(is.na(Gene) | Gene == "" | is.na(Base) | Base == "")
+cat("Restigouche - rows with empty Gene/Base:", nrow(res_check), "\n")
+
+# Check Madawaska
+mad_check <- Madawaska_raw %>%
+  filter(is.na(Gene) | Gene == "" | is.na(Base) | Base == "")
+cat("Madawaska - rows with empty Gene/Base:", nrow(mad_check), "\n")
+
+# Check unique codes in each region
+cat("\n=== Sample sizes per region ===\n")
+cat("Penninsule unique individuals:", n_distinct(Penninsule_raw$Code), "\n")
+cat("Restigouche unique individuals:", n_distinct(Restigouche_raw$Code), "\n")
+cat("Madawaska unique individuals:", n_distinct(Madawaska_raw$Code), "\n")
+cat("Total unique individuals across all regions:", n_distinct(all_patient_data$Code), "\n")
+
+# Check if there are individuals with NA/empty genes
+cat("\n=== Checking for individuals with NA/empty variant info ===\n")
+potential_non_carriers <- all_patient_data %>%
+  filter(is.na(Gene) | Gene == "" | Gene == "NA" | 
+           is.na(Base) | Base == "" | Base == "NA")
+
+if(nrow(potential_non_carriers) > 0) {
+  cat("Found", nrow(potential_non_carriers), "rows with empty variant info\n")
+  cat("Unique individuals:", n_distinct(potential_non_carriers$Code), "\n")
+  print(head(potential_non_carriers))
+} else {
+  cat("No rows with empty variant information found in the data files\n")
+}
+
+# Total expected
+cat("\n=== Summary ===\n")
+cat("You mentioned 180 total individuals with 15 non-carriers\n")
+cat("This means 165 should be carriers\n")
+cat("Currently we found:", n_distinct(all_patient_data$Code), "unique individual codes\n")
+cat("Difference:",
+
+
+
+
+
+
+
+
+
+
+
+
+
+### SECTION 6 - SIGNIFICANT GENES FOLLOWING MEMRAMCOOK COHORT ADDITION  ###
+
+# Import file
+Memramcook <- read_csv("~/Desktop/Article/Mem.csv")
+
+# Joining all four dataframes into one complete dataframe
+Results <- Madawaska %>%
+  full_join(Restigouche) %>%
+  full_join(Penninsule) %>%
+  full_join(Memramcook)
+
+# Extract gene names and version numbers
+Results$Gene_Name <- gsub("\\s*\\(NM_[0-9]+\\.[0-9]+\\)", "", Results$Gene)
+Results$Version <- as.numeric(gsub(".*\\(NM_[0-9]+\\.([0-9]+)\\)", "\\1", Results$Gene))
+
+# Find the latest version for each gene
+latest_versions <- aggregate(Version ~ Gene_Name, data = Results, max)
+
+# Merge the latest version back to the original data frame
+Results_merged <- merge(Results, latest_versions, by = "Gene_Name", all.x = TRUE)
+
+# Replace older versions with the latest version
+Results_merged$Gene <- with(Results_merged, paste(Gene_Name, "(NM_000018.", Version.y, ")", sep = ""))
+
+# Remove unnecessary columns
+Results_cleaned <- Results_merged[, c("Gene")]
+
+# Read the data from the Excel file
+df <- read_csv("/Users/alexboudreau/Desktop/Article/Book5.csv")
+
+# Clean the column names
+colnames(df) <- c( "Gene", "Base", "Protein", "Frequency_Acadian", "Allele_count_gnomAD", "Allele_number_gnomAD", "Number_of_homozygotes", "Allele_frequency_gnomAD", "Mode_of_transmission",  "Zygosity", "Associated_condition", "Allele_Frequency")
+
+# Convert relevant columns to numeric, setting any problematic values to NA
+df <- df %>%
+  mutate(
+    Frequency_Acadian = as.numeric(Frequency_Acadian),
+    Allele_count_gnomAD = as.numeric(Allele_count_gnomAD),
+    Allele_number_gnomAD = as.numeric(Allele_number_gnomAD),
+    Allele_Frequency = as.numeric(Allele_Frequency),
+    Allele_frequency_gnomAD = as.numeric(Allele_frequency_gnomAD)
+  )
+
+# Remove rows with NA values in relevant columns
+df <- df %>% filter(!is.na(Frequency_Acadian) & !is.na(Allele_count_gnomAD) & !is.na(Allele_number_gnomAD))
+
+# Function to perform one-tailed Fisher's exact test (alternative = "greater")
+fisher_test <- function(frequency_acadian, allele_count_gnomad, allele_number_gnomad) {
+  positive_acadian <- as.numeric(frequency_acadian)
+  negative_acadian <- 360 - as.numeric(frequency_acadian)
+  positive_gnomad <- as.numeric(allele_count_gnomad)
+  negative_gnomad <- as.numeric(allele_number_gnomad) - as.numeric(allele_count_gnomad)
+  
+  # Ensure all values are non-negative
+  if (positive_acadian < 0) positive_acadian <- 0
+  if (negative_acadian < 0) negative_acadian <- 0
+  if (positive_gnomad < 0) positive_gnomad <- 0
+  if (negative_gnomad < 0) negative_gnomad <- 0
+  
+  table <- matrix(c(positive_acadian, negative_acadian, positive_gnomad, negative_gnomad), nrow = 2)
+  test_result <- fisher.test(table, alternative = "greater")
+  return(test_result$p.value)
+}
+
+# Apply Fisher's test to each row
+df$p_value <- mapply(fisher_test, df$Frequency_Acadian, df$Allele_count_gnomAD, df$Allele_number_gnomAD)
+
+# Apply Bonferroni correction
+df$bonferroni_corrected_p <- p.adjust(df$p_value, method = "bonferroni")
+
+# Apply FDR correction
+df$fdr_corrected_p <- p.adjust(df$p_value, method = "BH")
+
+# Filter out rows with Allele_frequency_gnomAD equal to 0 to avoid division by zero
+filtered_df <- df %>%
+  filter(Allele_frequency_gnomAD != 0)
+
+# Calculate the allele frequency ratio
+filtered_df <- filtered_df %>%
+  mutate(allele_frequency_ratio = Allele_Frequency / Allele_frequency_gnomAD)
+
+# Calculate statistics for allele frequency ratios
+allele_freq_stats <- filtered_df %>%
+  summarise(
+    mean_ratio = mean(allele_frequency_ratio, na.rm = TRUE),
+    median_ratio = median(allele_frequency_ratio, na.rm = TRUE),
+    sd_ratio = sd(allele_frequency_ratio, na.rm = TRUE),
+    min_ratio = min(allele_frequency_ratio, na.rm = TRUE),
+    max_ratio = max(allele_frequency_ratio, na.rm = TRUE)
+  )
+
+# Group data by Gene and Base to get unique base counts
+unique_base_counts <- df %>%
+  group_by(Gene, Base) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  arrange(Frequency_Acadian)
+
+# Threshold line for significance
+threshold_line <- -log10(0.05)
+
+# Add significance flags
+df$Significant_Bonf <- df$bonferroni_corrected_p < 0.05
+df$Significant_Raw  <- df$p_value < 0.05
+
+# Define custom colors
+custom_colors <- c("#FF6B6B", "#4ECDC4", "#45B7D1")
+significant_color <- custom_colors[1]  # Using the first color for significant points
+
+# Panel A: Bonferroni-corrected p-values
+plot_A <- ggplot(df, aes(x = Allele_Frequency, y = -log10(bonferroni_corrected_p))) +
+  geom_point(aes(color = Significant_Bonf), alpha = 0.8, size = 3) +
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = significant_color)) +
+  geom_text_repel(
+    data = df[df$Significant_Bonf, ],
+    aes(label = Gene),
+    size = 3.5, fontface = "bold", color = significant_color, max.overlaps = 15
+  ) +
+  geom_hline(yintercept = threshold_line, linetype = "dashed", color = "black", size = 1) +
+  labs(x = "Allele Frequency (gnomAD)",
+       y = expression(bold(-log[10]("Bonferroni-corrected p-value")))) +
+  annotate("text", x = -Inf, y = Inf, label = "A",
+           hjust = -0.8, vjust = 1.5, size = 8, fontface = "bold") +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(face = "bold", color = "black", size = 14),
+    axis.title = element_text(face = "bold", color = "black", size = 16),
+    plot.title = element_text(face = "bold", color = "black", size = 18)
+  )
+
+# Panel B: Raw p-values
+plot_B <- ggplot(df, aes(x = Allele_Frequency, y = -log10(p_value))) +
+  geom_point(aes(color = Significant_Raw), alpha = 0.8, size = 3) +
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = significant_color)) +
+  geom_text_repel(
+    data = df[df$Significant_Raw, ],
+    aes(label = Gene),
+    size = 5, fontface = "bold", color = significant_color, max.overlaps = 15
+  ) +
+  geom_hline(yintercept = threshold_line, linetype = "dashed", color = "black", size = 1) +
+  labs(x = "Allele Frequency (gnomAD)",
+       y = expression(bold(-log[10]("Raw p-value")))) +
+  annotate("text", x = -Inf, y = Inf, label = "B",
+           hjust = -0.8, vjust = 1.5, size = 8, fontface = "bold") +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(face = "bold", color = "black", size = 14),
+    axis.title = element_text(face = "bold", color = "black", size = 16),
+    plot.title = element_text(face = "bold", color = "black", size = 18)
+  )
+
+# Combine with added vertical spacing
+multi_panel_plot <- plot_A / plot_B +
+  plot_layout(heights = c(1, 1)) &
+  theme(plot.margin = margin(15, 15, 30, 15))  
+
+# Save high-resolution PNG
+ggsave("fisher_multipanel_figure.png", multi_panel_plot, width = 8, height = 14, dpi = 600)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### SECTION 4 - GENE EXPRESSION BY REGION VISUALIZATION ###
+
+library(tidyverse)
+library(ggplot2)
+library(ggridges)
+library(patchwork)
+library(ggtext)
+
+# Add region identifier columns to each dataframe before joining
+Penninsule$region <- "Pen"  # Acadian Peninsula
+Restigouche$region <- "Res" # Restigouche
+Madawaska$region <- "Mad"   # Madawaska
+
+# Joining all three dataframes into one complete dataframe
+Results <- bind_rows(Madawaska, Restigouche, Penninsule)
+
+# Extract gene names and version numbers
+Results$Gene_Name <- gsub("\\s*\\(NM_[0-9]+\\.[0-9]+\\)", "", Results$Gene)
+Results$Version <- as.numeric(gsub(".*\\(NM_[0-9]+\\.([0-9]+)\\)", "\\1", Results$Gene))
+
+# Find the latest version for each gene
+latest_versions <- aggregate(Version ~ Gene_Name, data = Results, max)
+
+# Merge the latest version back to the original data frame
+Results_merged <- merge(Results, latest_versions, by = "Gene_Name", all.x = TRUE)
+
+# Replace older versions with the latest version
+Results_merged$Gene <- with(Results_merged, paste(Gene_Name, "(NM_000018.", Version.y, ")", sep = ""))
+
+# Keep only necessary columns including region information
+Results_cleaned <- Results_merged[, c("Gene", "Gene_Name", "region", "Base", "proteine")]
+
+# Export the merged data with region information
+write.csv(Results_merged, "~/Desktop/Results_merged_with_regions.csv", row.names = FALSE)
+
+# Theme with large fonts and no titles
+publication_theme <- theme_minimal() +
+  theme(
+    text = element_text(size = 14, family = "Arial"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    legend.title = element_text(size = 13, face = "bold", color = "black"),
+    legend.text = element_text(size = 12, color = "black"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.background = element_rect(fill = "white"),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    legend.position = "right",
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    legend.key = element_rect(fill = "white"),
+    legend.margin = margin(t = 10, r = 10, b = 10, l = 15),
+    legend.box.margin = margin(t = 5, r = 5, b = 5, l = 5),
+    legend.key.width = unit(1.2, "cm"),
+    legend.key.height = unit(0.6, "cm"),
+    plot.margin = margin(10, 10, 10, 10, "pt"),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.2, "cm")
+  )
+
+# Define custom color palette
+custom_colors <- c("#FF6B6B", "#4ECDC4", "#45B7D1")
+
+# Create a mapping from abbreviated to full region names
+region_names <- c(
+  "Pen" = "Acadian Peninsula",
+  "Res" = "Restigouche",
+  "Mad" = "Madawaska"
+)
+
+# Add full region names to the dataframe, clean gene names, and remove NA genes
+Results_full <- Results_cleaned %>%
+  mutate(region_full = region_names[region]) %>%
+  mutate(Gene_clean = case_when(
+    is.na(Gene) | Gene == "NA" ~ NA_character_,
+    grepl("\\(NM_", Gene) ~ str_extract(Gene, "^[^(]+"),
+    TRUE ~ Gene
+  )) %>%
+  filter(!is.na(Gene_clean) & Gene_clean != "NA" & Gene_clean != "")
+
+# 1. Horizontal Stacked Bar Chart - Panel A
+top_genes <- Results_full %>%
+  count(Gene_clean) %>%
+  arrange(desc(n)) %>%
+  head(12) %>%
+  pull(Gene_clean)
+
+top_gene_data <- Results_full %>%
+  filter(Gene_clean %in% top_genes) %>%
+  group_by(Gene_clean, region_full) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Gene_clean) %>%
+  mutate(total = sum(count),
+         percentage = count / total * 100) %>%
+  arrange(desc(total), Gene_clean) %>%
+  mutate(Gene_clean = paste0("<i>", Gene_clean, "</i>"))  # italicize labels
+
+# Panel A - Horizontal stacked bar chart
+p1 <- ggplot(top_gene_data, aes(x = count, y = reorder(Gene_clean, total), fill = region_full)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +
+  scale_fill_manual(values = custom_colors, name = "Region") +
+  scale_x_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 5)) +
+  labs(x = "Variant allele count", y = "Gene") +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    axis.text.y = element_markdown(size = 12, color = "black"),  # italic y-axis labels
+    plot.margin = margin(25, 25, 10, 10, "pt")
+  ) +
+  guides(fill = guide_legend(
+    title.position = "top",
+    title.hjust = 0.5,
+    label.position = "right",
+    byrow = TRUE,
+    override.aes = list(size = 1.2)
+  ))
+
+# 2. Ridge Plot - Panel B
+region_profiles <- Results_full %>%
+  group_by(region_full, Gene_clean) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(region_full) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+p2 <- ggplot(region_profiles, aes(x = proportion, y = region_full, fill = region_full)) +
+  geom_density_ridges(scale = 1.5, alpha = 0.8, bandwidth = 0.003) +
+  scale_fill_manual(values = custom_colors) +
+  scale_x_continuous(expand = c(0.01, 0), limits = c(0, 0.15),
+                     breaks = seq(0, 0.15, 0.03)) +
+  labs(x = "Proportion of total regional expression", y = "Region") +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14, family = "Arial"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(color = "gray90", linewidth = 0.3),
+    panel.grid.major.y = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    plot.margin = margin(25, 10, 10, 10, "pt")
+  )
+
+# 3. Bubble Plot - Panel C
+gene_variation <- Results_full %>%
+  group_by(Gene_clean, region_full) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = region_full, values_from = count, values_fill = 0) %>%
+  rowwise() %>%
+  mutate(
+    total = sum(c_across(where(is.numeric))),
+    variation = sd(c_across(where(is.numeric))) / (mean(c_across(where(is.numeric))) + 0.1)
+  ) %>%
+  ungroup() %>%
+  arrange(desc(variation)) %>%
+  head(12)
+
+region_columns <- c("Acadian Peninsula", "Madawaska", "Restigouche")
+
+bubble_data <- gene_variation %>%
+  pivot_longer(cols = all_of(region_columns),
+               names_to = "region_full", values_to = "count") %>%
+  mutate(proportion = count / total,
+         Gene_clean = paste0("<i>", Gene_clean, "</i>"))  # italicize labels
+
+custom_gradient <- colorRampPalette(c("#45B7D1", "#4ECDC4", "#FF6B6B"))(100)
+
+p3 <- ggplot(bubble_data, aes(x = region_full, y = reorder(Gene_clean, -variation),
+                              size = count, color = proportion)) +
+  geom_point(alpha = 0.85, stroke = 0.5) +
+  scale_size_continuous(range = c(2, 10), name = "Count") +
+  scale_color_gradientn(colors = custom_gradient, name = "Proportion") +
+  scale_x_discrete(expand = c(0.1, 0.1)) +
+  labs(x = "Region", y = "Gene") +
+  publication_theme +
+  theme(
+    axis.text.y = element_markdown(size = 12, color = "black"),  # italic y-axis labels
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    panel.grid.major = element_line(color = "gray95", linewidth = 0.3),
+    legend.box = "horizontal",
+    legend.position = "bottom",
+    plot.margin = margin(25, 10, 20, 10, "pt")
+  )
+
+# Panel label helper
+add_panel_label <- function(plot, label) {
+  plot +
+    annotation_custom(
+      grob = grid::textGrob(label, x = 0.02, y = 1.05,
+                            gp = grid::gpar(fontsize = 16, fontface = "bold")),
+      xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf
+    ) +
+    coord_cartesian(clip = "off")
+}
+
+# Add panel labels
+p1_labeled <- add_panel_label(p1, "A")
+p2_labeled <- add_panel_label(p2, "B")
+p3_labeled <- add_panel_label(p3, "C")
+
+# Combine all panels
+combined_figure <- p1_labeled / p2_labeled / p3_labeled + plot_layout(heights = c(1, 0.6, 1.2))
+
+# Save final figures
+ggsave("gene_expression_by_region_publication.png", combined_figure, width = 8.5, height = 14, dpi = 600)
+ggsave("panel_A_gene_distribution.png", p1_labeled, width = 8.5, height = 4, dpi = 600)
+ggsave("panel_B_expression_profiles.png", p2_labeled, width = 8.5, height = 3, dpi = 600)
+ggsave("panel_C_bubble_plot.png", p3_labeled, width = 8.5, height = 5, dpi = 600)
+
+
+
+
+
+
+
+
+
+
+
+
+# Calculate proportion of each gene in each region
+gene_region_props <- Results_full %>%
+  filter(Gene_clean %in% genes_to_plot) %>%
+  group_by(Gene_clean, region) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Gene_clean) %>%
+  mutate(proportion = count / sum(count))
+
+# Add coordinates
+gene_region_props <- gene_region_props %>%
+  left_join(points %>% select(region_code, longitude, latitude), 
+            by = c("region" = "region_code"))
+
+# Create faceted map
+ggplot() +
+  geom_sf(data = new_brunswick, fill = "white", color = "black", size = 0.5) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.3, size = 0.5) +
+  geom_point(data = gene_region_props,
+             aes(x = longitude, y = latitude, size = count, color = proportion),
+             alpha = 0.8) +
+  scale_size_continuous(range = c(3, 15), name = "Count") +
+  scale_color_gradient(low = "#4ECDC4", high = "#FF6B6B", name = "Proportion") +
+  facet_wrap(~ Gene_clean, ncol = 4) +
+  theme_void() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.position = "bottom"
+  )
+
+
+
+
+
+
+
+
+
+
+
+
+
+### SECTION 4 - GENE EXPRESSION BY REGION VISUALIZATION (ENHANCED) ###
+
+# Add region identifier columns to each dataframe before joining
+Penninsule$region <- "Pen"  # Acadian Peninsula
+Restigouche$region <- "Res" # Restigouche
+Madawaska$region <- "Mad"   # Madawaska
+
+# Joining all three dataframes into one complete dataframe
+Results <- bind_rows(Madawaska, Restigouche, Penninsule)
+
+# Extract gene names and version numbers
+Results$Gene_Name <- gsub("\\s*\\(NM_[0-9]+\\.[0-9]+\\)", "", Results$Gene)
+Results$Version <- as.numeric(gsub(".*\\(NM_[0-9]+\\.([0-9]+)\\)", "\\1", Results$Gene))
+
+# Find the latest version for each gene
+latest_versions <- aggregate(Version ~ Gene_Name, data = Results, max)
+
+# Merge the latest version back to the original data frame
+Results_merged <- merge(Results, latest_versions, by = "Gene_Name", all.x = TRUE)
+
+# Replace older versions with the latest version
+Results_merged$Gene <- with(Results_merged, paste(Gene_Name, "(NM_000018.", Version.y, ")", sep = ""))
+
+# Keep only necessary columns including region information
+Results_cleaned <- Results_merged[, c("Gene", "Gene_Name", "region", "Base", "proteine")]
+
+# Export the merged data with region information
+write.csv(Results_merged, "~/Desktop/Results_merged_with_regions.csv", row.names = FALSE)
+
+#Theme with large fonts and no titles
+publication_theme <- theme_minimal() +
+  theme(
+    # Larger base font sizes for readability at print scale
+    text = element_text(size = 14, family = "Arial"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    legend.title = element_text(size = 13, face = "bold", color = "black"),
+    legend.text = element_text(size = 12, color = "black"),
+    
+    # Clean panel appearance
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.background = element_rect(fill = "white"),
+    
+    # Remove titles for publication
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    
+    # Clean legend with padding
+    legend.position = "right",
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    legend.key = element_rect(fill = "white"),
+    legend.margin = margin(t = 10, r = 10, b = 10, l = 15), 
+    legend.box.margin = margin(t = 5, r = 5, b = 5, l = 5),  
+    legend.key.width = unit(1.2, "cm"),   
+    legend.key.height = unit(0.6, "cm"),  
+    
+    # Margins for proper spacing
+    plot.margin = margin(10, 10, 10, 10, "pt"),
+    
+    # Axis appearance
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.2, "cm")
+  )
+
+# Define custom color palette
+custom_colors <- c("#FF6B6B", "#4ECDC4", "#45B7D1")
+
+# Create a mapping from abbreviated to full region names
+region_names <- c(
+  "Pen" = "Acadian Peninsula",
+  "Res" = "Restigouche",
+  "Mad" = "Madawaska"
+)
+
+# Add full region names to the dataframe, clean gene names, and remove NA genes
+Results_full <- Results_cleaned %>%
+  mutate(region_full = region_names[region]) %>%
+  # Clean gene names by removing NM identifiers and extract just the gene symbol
+  mutate(Gene_clean = case_when(
+    is.na(Gene) | Gene == "NA" ~ NA_character_,
+    grepl("\\(NM_", Gene) ~ str_extract(Gene, "^[^(]+"),  # Extract part before (NM_)
+    TRUE ~ Gene
+  )) %>%
+  filter(!is.na(Gene_clean) & Gene_clean != "NA" & Gene_clean != "")  # Remove NA values and empty strings
+
+# ============================================================================
+# STATISTICAL TESTING - Chi-square tests for regional independence
+# ============================================================================
+
+# For top genes, perform chi-square tests
+top_genes <- Results_full %>%
+  count(Gene_clean) %>%
+  arrange(desc(n)) %>%
+  head(13) %>%  
+  pull(Gene_clean)
+
+# Perform chi-square test for each top gene
+chi_square_results <- data.frame()
+for (gene in top_genes) {
+  gene_data <- Results_full %>%
+    filter(Gene_clean == gene) %>%
+    count(region_full) %>%
+    complete(region_full = region_names, fill = list(n = 0))
+  
+  # Create contingency table
+  observed <- gene_data$n
+  total <- sum(observed)
+  expected <- rep(total/3, 3)  # Equal distribution expected
+  
+  # Chi-square test
+  test <- chisq.test(observed)
+  
+  chi_square_results <- rbind(chi_square_results, data.frame(
+    Gene = gene,
+    chi_square = test$statistic,
+    p_value = test$p.value,
+    significant = ifelse(test$p.value < 0.05, "Yes", "No")
+  ))
+}
+
+# Print statistical results
+print("Chi-square test results for regional distribution:")
+print(chi_square_results)
+
+# Export statistical results
+write.csv(chi_square_results, "~/Desktop/chi_square_regional_tests.csv", row.names = FALSE)
+
+# ============================================================================
+# PANEL A - Enhanced horizontal bar chart with significance indicators
+# ============================================================================
+
+top_gene_data <- Results_full %>%
+  filter(Gene_clean %in% top_genes) %>%
+  group_by(Gene_clean, region_full) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Gene_clean) %>%
+  mutate(total = sum(count),
+         percentage = count / total * 100) %>%
+  arrange(desc(total), Gene_clean) %>%
+  left_join(chi_square_results, by = c("Gene_clean" = "Gene"))
+
+# Create significance labels
+sig_labels <- chi_square_results %>%
+  arrange(desc(chi_square)) %>%
+  mutate(label = case_when(
+    p_value < 0.001 ~ "***",
+    p_value < 0.01 ~ "**",
+    p_value < 0.05 ~ "*",
+    TRUE ~ "ns"
+  ))
+
+p1 <- ggplot(top_gene_data, aes(x = count, y = reorder(Gene_clean, total), fill = region_full)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +
+  # Add significance stars
+  geom_text(data = sig_labels, 
+            aes(x = Inf, y = Gene, label = label, fill = NULL),
+            hjust = -0.3, size = 5, fontface = "bold") +
+  scale_fill_manual(values = custom_colors, name = "Region") +
+  scale_x_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 5),
+                     limits = c(0, max(top_gene_data$total) * 1.15)) +  # Extra space for stars
+  labs(
+    x = "Variant allele count",
+    y = "Gene",
+    caption = "*** p<0.001, ** p<0.01, * p<0.05, ns = not significant\nChi-square test for regional independence"
+  ) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    legend.margin = margin(t = 15, r = 15, b = 15, l = 20),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.key.width = unit(1.5, "cm"),   
+    legend.key.height = unit(0.8, "cm"), 
+    legend.spacing.y = unit(0.3, "cm"),  
+    plot.margin = margin(25, 35, 10, 10, "pt"),  # Extra right margin for stars
+    plot.caption = element_text(size = 10, hjust = 0, face = "italic")
+  ) +
+  guides(fill = guide_legend(
+    title.position = "top",     
+    title.hjust = 0.5,          
+    label.position = "right",  
+    byrow = TRUE,              
+    override.aes = list(size = 1.2)  
+  ))
+
+print(p1)
+
+# ============================================================================
+# PANEL A-ALT - Grouped bar chart for clearer comparison
+# ============================================================================
+
+p1_alt <- ggplot(top_gene_data, aes(x = reorder(Gene_clean, total), y = percentage, fill = region_full)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  coord_flip() +
+  # Add significance stars
+  geom_text(data = sig_labels, 
+            aes(x = Gene, y = Inf, label = label, fill = NULL),
+            hjust = -0.3, size = 5, fontface = "bold") +
+  scale_fill_manual(values = custom_colors, name = "Region") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 105),
+                     breaks = seq(0, 100, 25)) +
+  labs(
+    x = "Gene",
+    y = "Percentage of variants (%)",
+    caption = "*** p<0.001, ** p<0.01, * p<0.05, ns = not significant\nChi-square test for regional independence"
+  ) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    legend.margin = margin(t = 15, r = 15, b = 15, l = 20),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.key.width = unit(1.5, "cm"),   
+    legend.key.height = unit(0.8, "cm"), 
+    plot.margin = margin(25, 35, 10, 10, "pt"),
+    plot.caption = element_text(size = 10, hjust = 0, face = "italic")
+  )
+
+print(p1_alt)
+
+# ============================================================================
+# PANEL B - Ridge Plot (unchanged but enhanced)
+# ============================================================================
+
+region_profiles <- Results_full %>%
+  group_by(region_full, Gene_clean) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(region_full) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+p2 <- ggplot(region_profiles, aes(x = proportion, y = region_full, fill = region_full)) +
+  geom_density_ridges(scale = 1.5, alpha = 0.8, bandwidth = 0.003) +
+  scale_fill_manual(values = custom_colors) +
+  scale_x_continuous(expand = c(0.01, 0), limits = c(0, 0.15), 
+                     breaks = seq(0, 0.15, 0.03)) +
+  labs(
+    x = "Proportion of total regional expression",
+    y = "Region"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14, family = "Arial"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(color = "gray90", linewidth = 0.3),
+    panel.grid.major.y = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    plot.margin = margin(25, 10, 10, 10, "pt") 
+  )
+
+# ============================================================================
+# PANEL C - Bubble Plot (unchanged)
+# ============================================================================
+
+gene_variation <- Results_full %>%
+  group_by(Gene_clean, region_full) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = region_full, values_from = count, values_fill = 0) %>%
+  rowwise() %>%
+  mutate(
+    total = sum(c_across(where(is.numeric))),
+    variation = sd(c_across(where(is.numeric))) / (mean(c_across(where(is.numeric))) + 0.1)
+  ) %>%
+  ungroup() %>%
+  arrange(desc(variation)) %>%
+  head(12)
+
+region_columns <- c("Acadian Peninsula", "Madawaska", "Restigouche")
+
+bubble_data <- gene_variation %>%
+  pivot_longer(
+    cols = all_of(region_columns), 
+    names_to = "region_full",
+    values_to = "count"
+  ) %>%
+  mutate(proportion = count / total)
+
+custom_gradient <- colorRampPalette(c("#45B7D1", "#4ECDC4", "#FF6B6B"))(100)
+
+p3 <- ggplot(bubble_data, aes(x = region_full, y = reorder(Gene_clean, -variation), 
+                              size = count, color = proportion)) +
+  geom_point(alpha = 0.85, stroke = 0.5) +
+  scale_size_continuous(range = c(2, 10), breaks = c(1, 5, 10, 15), 
+                        name = "Count", guide = guide_legend(override.aes = list(alpha = 1))) +
+  scale_color_gradientn(colors = custom_gradient, name = "Proportion",
+                        guide = guide_colorbar(barwidth = 1.2, barheight = 8)) +
+  scale_x_discrete(expand = c(0.1, 0.1)) +
+  labs(
+    x = "Region",
+    y = "Gene"
+  ) +
+  publication_theme +
+  theme(
+    panel.grid.major = element_line(color = "gray95", linewidth = 0.3),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    legend.box = "horizontal",
+    legend.position = "bottom",
+    legend.margin = margin(t = 20, r = 10, b = 15, l = 10),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.box.spacing = unit(1, "cm"),     
+    legend.key.width = unit(1.5, "cm"),     
+    legend.key.height = unit(0.8, "cm"),   
+    legend.spacing.x = unit(0.8, "cm"),     
+    plot.margin = margin(25, 10, 20, 10, "pt")  
+  ) +
+  guides(
+    size = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      label.position = "bottom",
+      override.aes = list(alpha = 1),
+      keywidth = unit(1.2, "cm"),
+      keyheight = unit(0.8, "cm")
+    ),
+    color = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = unit(3, "cm"),    
+      barheight = unit(0.8, "cm"), 
+      label.position = "bottom"
+    )
+  )
+
+# ============================================================================
+# CREATE PIE CHART DATA FOR MAP
+# ============================================================================
+
+# Calculate regional totals for pie charts
+regional_totals <- Results_full %>%
+  group_by(region) %>%
+  summarize(total_variants = n(), .groups = "drop") %>%
+  mutate(region_full = region_names[region])
+
+# Define the specific genes to include
+genes_to_plot <- c("GJB2", "CPT1A", "USH2A", "GALNS", "SLC7A5", "TRMU", 
+                   "TMEM216", "BBS10", "ETFDH", "ACADVL", "BBS12", "MMACHC", "LIPA")
+
+# For more detailed pie charts, we can show top genes per region
+# MODIFIED: Filter to only include specified genes
+regional_gene_composition <- Results_full %>%
+  filter(Gene_clean %in% genes_to_plot) %>%  # FILTER HERE
+  group_by(region, Gene_clean) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(region) %>%
+  mutate(
+    total = sum(count),
+    percentage = count / total * 100,
+    rank = rank(-count, ties.method = "first")
+  ) %>%
+  mutate(region_full = region_names[region])
+
+# Save pie chart data for use in the map script
+write.csv(regional_totals, "~/Desktop/regional_totals_for_map.csv", row.names = FALSE)
+write.csv(regional_gene_composition, "~/Desktop/regional_gene_composition_for_map.csv", row.names = FALSE)
+
+
+
+### SECTION 5 - REGIONAL HEALTH ZONES MAP WITH PIE CHARTS AND SIGNIFICANT GENES SCATTERPLOT ###
+
+library(scatterpie)  # For pie charts on maps
+
+# Define color palettes
+zone_levels <- as.character(1:7)
+zone_palette <- setNames(c("white", "white", "white", "grey70", "grey70", "grey70", "white"), zone_levels)
+province_levels <- c("NB", "NL", "NS", "PE", "QC")
+province_palette <- setNames(c("grey90", "white", "white", "white", "white"), province_levels)
+
+# Custom colors matching the gene expression plots
+custom_colors <- c("Madawaska" = "#FF6B6B", 
+                   "Restigouche" = "#4ECDC4", 
+                   "Acadian Peninsula" = "#45B7D1")
+
+# Get Canada map data
+canada <- ne_states(country = "canada", returnclass = "sf")
+relevant_provinces <- c("New Brunswick", "Nova Scotia", "Prince Edward Island", 
+                        "Québec", "Newfoundland and Labrador")
+main_map_data <- canada %>% 
+  filter(name %in% relevant_provinces)
+new_brunswick <- canada %>% 
+  filter(name == "New Brunswick")
+
+# Read NB health regions
+nb_health_regions <- st_read("/Users/alexboudreau/Downloads/geonb_hr-rs_shp/NBDOH_HealthRegions_Jan2023.shp")
+nb_health_regions <- st_transform(nb_health_regions, st_crs(new_brunswick))
+
+# ============================================================================
+# PREPARE PIE CHART DATA
+# ============================================================================
+
+# Read the regional composition data created in the previous script
+# If files don't exist, create sample data
+if (file.exists("~/Desktop/regional_gene_composition_for_map.csv")) {
+  regional_composition <- read.csv("~/Desktop/regional_gene_composition_for_map.csv")
+  # FILTER: Remove "Other" and ensure only specified genes
+  regional_composition <- regional_composition %>%
+    filter(Gene_clean %in% genes_to_plot)
+} else {
+  # Sample data structure - replace with actual data (filtered to genes_to_plot)
+  regional_composition <- data.frame(
+    region = c("Mad", "Mad", "Mad", "Res", "Res", "Res", "Pen", "Pen", "Pen"),
+    Gene_clean = c("GJB2", "CPT1A", "USH2A", "GJB2", "CPT1A", "GALNS", "GJB2", "CPT1A", "SLC7A5"),
+    count = c(15, 8, 5, 12, 10, 6, 14, 9, 7),
+    region_full = c(rep("Madawaska", 3), rep("Restigouche", 3), rep("Acadian Peninsula", 3))
+  )
+}
+
+# Points data with pie chart information
+points <- data.frame(
+  name = c("Restigouche", "Peninsula", "Madawaska"),
+  region_code = c("Res", "Pen", "Mad"),
+  longitude = c(-66.5, -64.9, -68.3),  
+  latitude = c(48.0, 47.7, 47.4),
+  n_value = c("n=60", "n=60", "n=60")
+)
+
+points_sf <- st_as_sf(points, coords = c("longitude", "latitude"), 
+                      crs = st_crs(new_brunswick))
+
+# ============================================================================
+# CREATE PIE CHART OVERLAY DATA
+# ============================================================================
+
+# MODIFIED: Include ALL genes_to_plot, no "Other" category
+pie_for_map <- regional_composition %>%
+  group_by(region, Gene_clean) %>%
+  summarize(value = sum(count), .groups = "drop") %>%
+  pivot_wider(names_from = Gene_clean, values_from = value, values_fill = 0)
+
+# Add coordinates to pie data
+pie_for_map <- pie_for_map %>%
+  left_join(points %>% select(region_code, longitude, latitude), 
+            by = c("region" = "region_code"))
+
+# Get column names that are genes (excluding region, longitude, latitude)
+gene_columns <- setdiff(names(pie_for_map), c("region", "longitude", "latitude"))
+
+# ============================================================================
+# DIVERSE COLOR PALETTE FOR 13 GENES
+# ============================================================================
+
+# Create a highly diverse color palette for the 13 genes
+diverse_colors <- c(
+  "#E63946",  # Red
+  "#F4A261",  # Orange
+  "#E9C46A",  # Gold
+  "#2A9D8F",  # Teal
+  "#264653",  # Dark blue-gray
+  "#8338EC",  # Purple
+  "#FF006E",  # Hot pink
+  "#06FFA5",  # Mint green
+  "#3A86FF",  # Bright blue
+  "#FB5607",  # Bright orange
+  "#FFBE0B",  # Yellow
+  "#06D6A0",  # Sea green
+  "#C1121F"   # Dark red
+)
+
+# Ensure we have colors for all genes present
+n_genes <- length(gene_columns)
+if (n_genes <= 13) {
+  gene_colors <- setNames(diverse_colors[1:n_genes], gene_columns)
+} else {
+  # If somehow more than 13 genes, extend palette
+  gene_colors <- setNames(colorRampPalette(diverse_colors)(n_genes), gene_columns)
+}
+
+# ============================================================================
+# MAIN MAP
+# ============================================================================
+
+main_map <- ggplot() +
+  geom_sf(data = main_map_data, aes(fill = postal), color = "black", size = 0.5) +
+  scale_fill_manual(values = province_palette, name = "") +
+  geom_sf(data = filter(main_map_data, name == "New Brunswick"), 
+          fill = NA, color = "black", linewidth = 1.5) +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.margin = margin(10, 10, 10, 10),
+    text = element_text(size = 18, color = "black", face = "bold")
+  )
+
+# ============================================================================
+# INSET MAP WITH PIE CHARTS
+# ============================================================================
+
+inset_map <- ggplot() +
+  geom_sf(data = new_brunswick, fill = "white", color = "black", size = 0.5) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.8, size = 0.5) +
+  scale_fill_manual(values = zone_palette, name = "Zone") +
+  # Add pie charts using scatterpie
+  geom_scatterpie(data = pie_for_map, 
+                  aes(x = longitude, y = latitude),
+                  cols = gene_columns,
+                  pie_scale = 5,  # Increased size for better visibility
+                  alpha = 0.9) +
+  scale_fill_manual(values = gene_colors, name = "Genes") +
+  # Add location labels
+  geom_segment(data = points_sf, 
+               aes(x = st_coordinates(geometry)[,1], 
+                   y = st_coordinates(geometry)[,2],
+                   xend = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                   yend = st_coordinates(geometry)[,2] + c(0.4, 0.4, 0.4)),
+               linewidth = 0.8, color = "black") +
+  geom_text(data = points_sf, 
+            aes(x = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                y = st_coordinates(geometry)[,2] + c(0.4, 0.4, 0.4),
+                label = name),
+            size = 6,  
+            hjust = c(0, 0, 1),
+            fontface = "bold") +
+  geom_text(data = points_sf, 
+            aes(x = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                y = st_coordinates(geometry)[,2] + c(0.25, 0.25, 0.25),
+                label = n_value),
+            size = 5,  
+            hjust = c(0, 0, 1),
+            fontface = "bold") +
+  theme_void() +
+  coord_sf(clip = "off") +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10),
+    legend.key.size = unit(0.5, "cm"),
+    plot.margin = margin(10, 10, 10, 10),
+    text = element_text(size = 18, color = "black", face = "bold")
+  )
+
+# ============================================================================
+# COMBINE MAPS
+# ============================================================================
+
+map_combined <- plot_grid(
+  main_map, inset_map,
+  ncol = 2,
+  rel_widths = c(1.3, 1.4),  # Wider for legend
+  align = "h"
+)
+
+# Add connection lines 
+panel_a <- ggdraw(map_combined) +
+  draw_line(x = c(0.30, 0.62), y = c(0.26, 0.95),
+            color = "black", linetype = "dashed", size = 1) +
+  draw_line(x = c(0.31, 0.62), y = c(0.19, 0.25),
+            color = "black", linetype = "dashed", size = 1)
+
+# ============================================================================
+# SCATTERPLOT - Panel B (with updated terminology)
+# ============================================================================
+
+scatter_data <- df %>%
+  group_by(Gene, Base) %>%
+  summarise(gene_frequency = sum(Frequency_Acadian), .groups = 'drop') %>%
+  group_by(Gene) %>%
+  summarise(
+    allele_count = sum(gene_frequency),
+    unique_variants = n(),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    category = case_when(
+      allele_count > 3 | unique_variants > 2 ~ "Above threshold",
+      TRUE ~ "Below threshold"
+    ),
+    show_label = allele_count > 3 | unique_variants > 2
+  )
+
+panel_b <- ggplot(scatter_data, aes(x = allele_count, y = unique_variants)) +
+  geom_point(aes(color = category, size = category), alpha = 0.8, 
+             position = position_jitter(width = 0.1, height = 0.1)) +
+  ggrepel::geom_text_repel(
+    data = filter(scatter_data, show_label),
+    aes(label = Gene),
+    size = 6,  
+    box.padding = 0.8,
+    point.padding = 0.5,
+    segment.color = "gray30",
+    segment.size = 0.6,
+    max.overlaps = 15,
+    force = 3,
+    fontface = "bold"
+  ) +
+  scale_color_manual(
+    values = c("Below threshold" = "grey50", 
+               "Above threshold" = "black"),
+    name = "",
+    labels = c("≤3 alleles AND ≤2 mutations", ">3 alleles OR >2 mutations")
+  ) +
+  scale_size_manual(
+    values = c("Below threshold" = 4, 
+               "Above threshold" = 6),
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 6),
+    expand = c(0.05, 0.05)
+  ) +
+  scale_y_continuous(
+    breaks = function(x) seq(floor(min(x)), ceiling(max(x)), by = 1),
+    expand = c(0.05, 0.05)
+  ) +
+  labs(
+    x = "Allele Count",
+    y = "Number of Unique Mutations"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(size = 20, color = "black", face = "bold"),  
+    axis.text = element_text(size = 18, color = "black", face = "bold"),  
+    axis.title = element_text(size = 22, color = "black", face = "bold"), 
+    legend.position = c(0.98, 0.98),  # Top right corner
+    legend.justification = c(1, 1),   # Anchor at top right
+    legend.text = element_text(size = 16, face = "bold"),  
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.8),
+    legend.margin = margin(t = 5, r = 5, b = 5, l = 5),
+    legend.box.margin = margin(0, 0, 0, 0),
+    panel.border = element_rect(color = "black", fill = NA, size = 1.2),
+    axis.line = element_blank(),
+    plot.margin = margin(15, 15, 15, 15)
+  ) +
+  geom_vline(xintercept = 3, linetype = "dashed", color = "gray40", alpha = 0.8, size = 0.8) + 
+  geom_hline(yintercept = 2, linetype = "dashed", color = "gray40", alpha = 0.8, size = 0.8)
+
+# ============================================================================
+# CREATE FINAL FIGURE
+# ============================================================================
+
+final_figure <- plot_grid(
+  panel_a, panel_b,
+  ncol = 1,
+  rel_heights = c(1, 1.2),
+  labels = c("A", "B"),
+  label_size = 36, 
+  label_fontface = "bold",
+  hjust = -0.1,
+  vjust = 1.1
+)
+
+# Save figure
+ggsave("publication_figure_filtered_genes.png", 
+       final_figure, 
+       width = 18,
+       height = 16,
+       dpi = 600,
+       bg = "white")
+
+# Display figure
+print(final_figure)
+
+
+
+
+
+
+
+
+
+
+
+### NEW BRUNSWICK MAP WITH GENE COMPOSITION PIE CHARTS ###
+
+library(scatterpie)  # For pie charts on maps
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(sf)
+library(rnaturalearth)
+library(cowplot)
+
+# Define color palettes
+zone_levels <- as.character(1:7)
+zone_palette <- setNames(c("white", "white", "white", "grey70", "grey70", "grey70", "white"), zone_levels)
+
+# Get Canada map data
+canada <- ne_states(country = "canada", returnclass = "sf")
+new_brunswick <- canada %>% 
+  filter(name == "New Brunswick")
+
+# Read NB health regions
+nb_health_regions <- st_read("/Users/alexboudreau/Downloads/geonb_hr-rs_shp/NBDOH_HealthRegions_Jan2023.shp")
+nb_health_regions <- st_transform(nb_health_regions, st_crs(new_brunswick))
+
+# ============================================================================
+# PREPARE PIE CHART DATA
+# ============================================================================
+
+# Define the specific genes to include
+genes_to_plot <- c("GJB2", "CPT1A", "USH2A", "GALNS", "SLC7A5", "TRMU", 
+                   "TMEM216", "BBS10", "ETFDH", "ACADVL", "BBS12", "MMACHC", "LIPA")
+
+# Read the regional composition data created in the previous script
+# If files don't exist, create sample data
+if (file.exists("~/Desktop/regional_gene_composition_for_map.csv")) {
+  regional_composition <- read.csv("~/Desktop/regional_gene_composition_for_map.csv")
+  # FILTER: Remove "Other" and ensure only specified genes
+  regional_composition <- regional_composition %>%
+    filter(Gene_clean %in% genes_to_plot)
+} else {
+  # Sample data structure - replace with actual data (filtered to genes_to_plot)
+  regional_composition <- data.frame(
+    region = c("Mad", "Mad", "Mad", "Res", "Res", "Res", "Pen", "Pen", "Pen"),
+    Gene_clean = c("GJB2", "CPT1A", "USH2A", "GJB2", "CPT1A", "GALNS", "GJB2", "CPT1A", "SLC7A5"),
+    count = c(15, 8, 5, 12, 10, 6, 14, 9, 7),
+    region_full = c(rep("Madawaska", 3), rep("Restigouche", 3), rep("Acadian Peninsula", 3))
+  )
+}
+
+# Points data with pie chart information
+points <- data.frame(
+  name = c("Restigouche", "Peninsula", "Madawaska"),
+  region_code = c("Res", "Pen", "Mad"),
+  longitude = c(-66.5, -64.9, -68.3),  
+  latitude = c(48.0, 47.7, 47.4),
+  n_value = c("n=60", "n=60", "n=60")
+)
+
+points_sf <- st_as_sf(points, coords = c("longitude", "latitude"), 
+                      crs = st_crs(new_brunswick))
+
+# ============================================================================
+# CREATE PIE CHART OVERLAY DATA
+# ============================================================================
+
+# MODIFIED: Include ALL specified genes, no "Other" category
+pie_for_map <- regional_composition %>%
+  group_by(region, Gene_clean) %>%
+  summarize(value = sum(count), .groups = "drop") %>%
+  pivot_wider(names_from = Gene_clean, values_from = value, values_fill = 0)
+
+# Add coordinates to pie data
+pie_for_map <- pie_for_map %>%
+  left_join(points %>% select(region_code, longitude, latitude), 
+            by = c("region" = "region_code"))
+
+# Get column names that are genes (excluding region, longitude, latitude)
+gene_columns <- setdiff(names(pie_for_map), c("region", "longitude", "latitude"))
+
+# ============================================================================
+# DIVERSE COLOR PALETTE FOR 13 GENES
+# ============================================================================
+
+# Create a highly diverse color palette for the 13 genes
+diverse_colors <- c(
+  "#E63946",  # Red
+  "#F4A261",  # Orange
+  "#E9C46A",  # Gold
+  "#2A9D8F",  # Teal
+  "#264653",  # Dark blue-gray
+  "#8338EC",  # Purple
+  "#FF006E",  # Hot pink
+  "#06FFA5",  # Mint green
+  "#3A86FF",  # Bright blue
+  "#FB5607",  # Bright orange
+  "#FFBE0B",  # Yellow
+  "#06D6A0",  # Sea green
+  "#C1121F"   # Dark red
+)
+
+# Ensure we have colors for all genes present
+n_genes <- length(gene_columns)
+if (n_genes <= 13) {
+  gene_colors <- setNames(diverse_colors[1:n_genes], gene_columns)
+} else {
+  # If somehow more than 13 genes, extend palette
+  gene_colors <- setNames(colorRampPalette(diverse_colors)(n_genes), gene_columns)
+}
+
+# ============================================================================
+# CALCULATE PIE CHART RADIUS FOR ANNOTATION LINE POSITIONING
+# ============================================================================
+
+# Calculate pie chart radius in map coordinates
+pie_scale_value <- 10
+pie_radius <- 0.67  # Adjust this value based on visual inspection
+
+# Calculate annotation line endpoints (stop at circle periphery)
+annotation_data <- data.frame(
+  region = c("Res", "Pen", "Mad"),
+  x_center = c(-66.5, -64.9, -68.3),
+  y_center = c(48.0, 47.7, 47.4),
+  x_label = c(-66.5 + 0.8, -64.9 + 0.8, -68.3 - 0.8),  # Label positions
+  y_label = c(48.0 + 0.5, 47.7 + 0.5, 47.4 + 0.5)
+)
+
+# Calculate angle from center to label for each point
+annotation_data <- annotation_data %>%
+  mutate(
+    # Calculate angle
+    angle = atan2(y_label - y_center, x_label - x_center),
+    # Calculate edge point on circle
+    x_edge = x_center + pie_radius * cos(angle),
+    y_edge = y_center + pie_radius * sin(angle)
+  )
+
+# ============================================================================
+# CREATE MAP WITH LARGER PIE CHARTS
+# ============================================================================
+
+nb_map <- ggplot() +
+  geom_sf(data = new_brunswick, fill = "white", color = "black", size = 0.5) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.8, size = 0.5) +
+  scale_fill_manual(values = zone_palette, name = "Zone") +
+  # Add larger pie charts using scatterpie
+  geom_scatterpie(data = pie_for_map, 
+                  aes(x = longitude, y = latitude),
+                  cols = gene_columns,
+                  pie_scale = pie_scale_value,  # Larger pies
+                  alpha = 0.9) +
+  scale_fill_manual(values = gene_colors, name = "Genes") +
+  # Add annotation lines that stop at circle edge
+  geom_segment(data = annotation_data, 
+               aes(x = x_edge, 
+                   y = y_edge,
+                   xend = x_label,
+                   yend = y_label),
+               linewidth = 1.0, color = "black") +
+  # Add location labels
+  geom_text(data = annotation_data, 
+            aes(x = x_label,
+                y = y_label,
+                label = c("Restigouche", "Peninsula", "Madawaska")),
+            size = 7,  
+            hjust = c(0, 0, 1),
+            vjust = 0.5,
+            fontface = "bold") +
+  # Add sample size labels
+  geom_text(data = annotation_data, 
+            aes(x = x_label,
+                y = y_label - 0.15,
+                label = c("n=60", "n=60", "n=60")),
+            size = 6,  
+            hjust = c(0, 0, 1),
+            vjust = 0.5,
+            fontface = "bold") +
+  theme_void() +
+  coord_sf(clip = "off") +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 12),
+    legend.key.size = unit(0.7, "cm"),
+    legend.box.spacing = unit(0.5, "cm"),
+    plot.margin = margin(20, 20, 20, 20),
+    text = element_text(size = 18, color = "black", face = "bold")
+  )
+
+# ============================================================================
+# SAVE FIGURE
+# ============================================================================
+
+ggsave("nb_map_gene_pies_filtered.png", 
+       nb_map, 
+       width = 14,
+       height = 12,
+       dpi = 600,
+       bg = "white")
+
+# Display map
+print(nb_map)
+
+# Print pie chart data for verification
+print("Pie chart data:")
+print(pie_for_map)
+
+# Print annotation line data for verification
+print("Annotation line endpoints:")
+print(annotation_data %>% select(region, x_center, y_center, x_edge, y_edge, x_label, y_label))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Import file
+Memramcook <- read_csv("~/Desktop/Article/Mem.csv")
+
+# Joining all four dataframes into one complete dataframe
+Results <- Madawaska %>%
+  full_join(Restigouche) %>%
+  full_join(Penninsule) %>%
+  full_join(Memramcook)
+
+# Extract gene names and version numbers
+Results$Gene_Name <- gsub("\\s*\\(NM_[0-9]+\\.[0-9]+\\)", "", Results$Gene)
+Results$Version <- as.numeric(gsub(".*\\(NM_[0-9]+\\.([0-9]+)\\)", "\\1", Results$Gene))
+
+# Find the latest version for each gene
+latest_versions <- aggregate(Version ~ Gene_Name, data = Results, max)
+
+# Merge the latest version back to the original data frame
+Results_merged <- merge(Results, latest_versions, by = "Gene_Name", all.x = TRUE)
+
+# Replace older versions with the latest version
+Results_merged$Gene <- with(Results_merged, paste(Gene_Name, "(NM_000018.", Version.y, ")", sep = ""))
+
+# Remove unnecessary columns
+Results_cleaned <- Results_merged[, c("Gene")]
+
+# Read the data from the Excel file
+df <- read_csv("/Users/alexboudreau/Desktop/Article/Book5.csv")
+
+# Clean the column names
+colnames(df) <- c( "Gene", "Base", "Protein", "Frequency_Acadian", "Allele_count_gnomAD", "Allele_number_gnomAD", "Number_of_homozygotes", "Allele_frequency_gnomAD", "Mode_of_transmission",  "Zygosity", "Associated_condition", "Allele_Frequency")
+
+# Convert relevant columns to numeric, setting any problematic values to NA
+df <- df %>%
+  mutate(
+    Frequency_Acadian = as.numeric(Frequency_Acadian),
+    Allele_count_gnomAD = as.numeric(Allele_count_gnomAD),
+    Allele_number_gnomAD = as.numeric(Allele_number_gnomAD),
+    Allele_Frequency = as.numeric(Allele_Frequency),
+    Allele_frequency_gnomAD = as.numeric(Allele_frequency_gnomAD)
+  )
+
+# Remove rows with NA values in relevant columns
+df <- df %>% filter(!is.na(Frequency_Acadian) & !is.na(Allele_count_gnomAD) & !is.na(Allele_number_gnomAD))
+
+# Function to perform one-tailed Fisher's exact test (alternative = "greater")
+fisher_test <- function(frequency_acadian, allele_count_gnomad, allele_number_gnomad) {
+  positive_acadian <- as.numeric(frequency_acadian)
+  negative_acadian <- 360 - as.numeric(frequency_acadian)
+  positive_gnomad <- as.numeric(allele_count_gnomad)
+  negative_gnomad <- as.numeric(allele_number_gnomad) - as.numeric(allele_count_gnomad)
+  
+  # Ensure all values are non-negative
+  if (positive_acadian < 0) positive_acadian <- 0
+  if (negative_acadian < 0) negative_acadian <- 0
+  if (positive_gnomad < 0) positive_gnomad <- 0
+  if (negative_gnomad < 0) negative_gnomad <- 0
+  
+  table <- matrix(c(positive_acadian, negative_acadian, positive_gnomad, negative_gnomad), nrow = 2)
+  test_result <- fisher.test(table, alternative = "greater")
+  return(test_result$p.value)
+}
+
+# Apply Fisher's test to each row
+df$p_value <- mapply(fisher_test, df$Frequency_Acadian, df$Allele_count_gnomAD, df$Allele_number_gnomAD)
+
+# Apply Bonferroni correction
+df$bonferroni_corrected_p <- p.adjust(df$p_value, method = "bonferroni")
+
+# Apply FDR correction
+df$fdr_corrected_p <- p.adjust(df$p_value, method = "BH")
+
+# Filter out rows with Allele_frequency_gnomAD equal to 0 to avoid division by zero
+filtered_df <- df %>%
+  filter(Allele_frequency_gnomAD != 0)
+
+# Calculate the allele frequency ratio
+filtered_df <- filtered_df %>%
+  mutate(allele_frequency_ratio = Allele_Frequency / Allele_frequency_gnomAD)
+
+# Calculate statistics for allele frequency ratios
+allele_freq_stats <- filtered_df %>%
+  summarise(
+    mean_ratio = mean(allele_frequency_ratio, na.rm = TRUE),
+    median_ratio = median(allele_frequency_ratio, na.rm = TRUE),
+    sd_ratio = sd(allele_frequency_ratio, na.rm = TRUE),
+    min_ratio = min(allele_frequency_ratio, na.rm = TRUE),
+    max_ratio = max(allele_frequency_ratio, na.rm = TRUE)
+  )
+
+# Group data by Gene and Base to get unique base counts
+unique_base_counts <- df %>%
+  group_by(Gene, Base) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  arrange(Frequency_Acadian)
+
+# Threshold line for significance
+threshold_line <- -log10(0.05)
+
+# Add significance flags
+df$Significant_Bonf <- df$bonferroni_corrected_p < 0.05
+df$Significant_Raw  <- df$p_value < 0.05
+
+# Define custom colors
+custom_colors <- c("#FF6B6B", "#4ECDC4", "#45B7D1")
+significant_color <- custom_colors[1]  # Using the first color for significant points
+
+# Panel A: Bonferroni-corrected p-values
+plot_A <- ggplot(df, aes(x = Allele_Frequency, y = -log10(bonferroni_corrected_p))) +
+  geom_point(aes(color = Significant_Bonf), alpha = 0.8, size = 3) +
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = significant_color)) +
+  geom_text_repel(
+    data = df[df$Significant_Bonf, ],
+    aes(label = Gene),
+    size = 3.5, fontface = "bold", color = significant_color, max.overlaps = 15
+  ) +
+  geom_hline(yintercept = threshold_line, linetype = "dashed", color = "black", size = 1) +
+  labs(x = "Allele Frequency (gnomAD)",
+       y = expression(bold(-log[10]("Bonferroni-corrected p-value")))) +
+  annotate("text", x = -Inf, y = Inf, label = "A",
+           hjust = -0.8, vjust = 1.5, size = 8, fontface = "bold") +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(face = "bold", color = "black", size = 14),
+    axis.title = element_text(face = "bold", color = "black", size = 16),
+    plot.title = element_text(face = "bold", color = "black", size = 18)
+  )
+
+# Panel B: Raw p-values
+plot_B <- ggplot(df, aes(x = Allele_Frequency, y = -log10(p_value))) +
+  geom_point(aes(color = Significant_Raw), alpha = 0.8, size = 3) +
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = significant_color)) +
+  geom_text_repel(
+    data = df[df$Significant_Raw, ],
+    aes(label = Gene),
+    size = 5, fontface = "bold", color = significant_color, max.overlaps = 15
+  ) +
+  geom_hline(yintercept = threshold_line, linetype = "dashed", color = "black", size = 1) +
+  labs(x = "Allele Frequency (gnomAD)",
+       y = expression(bold(-log[10]("Raw p-value")))) +
+  annotate("text", x = -Inf, y = Inf, label = "B",
+           hjust = -0.8, vjust = 1.5, size = 8, fontface = "bold") +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(face = "bold", color = "black", size = 14),
+    axis.title = element_text(face = "bold", color = "black", size = 16),
+    plot.title = element_text(face = "bold", color = "black", size = 18)
+  )
+
+# Combine with added vertical spacing
+multi_panel_plot <- plot_A / plot_B +
+  plot_layout(heights = c(1, 1)) &
+  theme(plot.margin = margin(15, 15, 30, 15))  
+
+# Save high-resolution PNG
+ggsave("fisher_multipanel_figure.png", multi_panel_plot, width = 8, height = 14, dpi = 600)
+
+
+
+
+
+
+
+
+
+
+
+
+
+### SECTION 4 - GENE EXPRESSION BY REGION VISUALIZATION (ENHANCED) ###
+
+# Add region identifier columns to each dataframe before joining
+Penninsule$region <- "Pen"  # Acadian Peninsula
+Restigouche$region <- "Res" # Restigouche
+Madawaska$region <- "Mad"   # Madawaska
+Memramcook$region <- "Mem"
+
+# Joining all three dataframes into one complete dataframe
+Results <- bind_rows(Madawaska, Restigouche, Penninsule, Memramcook)
+
+# Extract gene names and version numbers
+Results$Gene_Name <- gsub("\\s*\\(NM_[0-9]+\\.[0-9]+\\)", "", Results$Gene)
+Results$Version <- as.numeric(gsub(".*\\(NM_[0-9]+\\.([0-9]+)\\)", "\\1", Results$Gene))
+
+# Find the latest version for each gene
+latest_versions <- aggregate(Version ~ Gene_Name, data = Results, max)
+
+# Merge the latest version back to the original data frame
+Results_merged <- merge(Results, latest_versions, by = "Gene_Name", all.x = TRUE)
+
+# Replace older versions with the latest version
+Results_merged$Gene <- with(Results_merged, paste(Gene_Name, "(NM_000018.", Version.y, ")", sep = ""))
+
+# Keep only necessary columns including region information
+Results_cleaned <- Results_merged[, c("Gene", "Gene_Name", "region", "Base", "proteine")]
+
+# Export the merged data with region information
+write.csv(Results_merged, "~/Desktop/Results_merged_with_regions.csv", row.names = FALSE)
+
+#Theme with large fonts and no titles
+publication_theme <- theme_minimal() +
+  theme(
+    # Larger base font sizes for readability at print scale
+    text = element_text(size = 14, family = "Arial"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    legend.title = element_text(size = 13, face = "bold", color = "black"),
+    legend.text = element_text(size = 12, color = "black"),
+    
+    # Clean panel appearance
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.background = element_rect(fill = "white"),
+    
+    # Remove titles for publication
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    
+    # Clean legend with padding
+    legend.position = "right",
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    legend.key = element_rect(fill = "white"),
+    legend.margin = margin(t = 10, r = 10, b = 10, l = 15), 
+    legend.box.margin = margin(t = 5, r = 5, b = 5, l = 5),  
+    legend.key.width = unit(1.2, "cm"),   
+    legend.key.height = unit(0.6, "cm"),  
+    
+    # Margins for proper spacing
+    plot.margin = margin(10, 10, 10, 10, "pt"),
+    
+    # Axis appearance
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.2, "cm")
+  )
+
+# Define custom color palette
+custom_colors <- c("#FF6B6B", "#4ECDC4", "#45B7D1", "purple")
+
+# Create a mapping from abbreviated to full region names
+region_names <- c(
+  "Pen" = "Acadian Peninsula",
+  "Res" = "Restigouche",
+  "Mad" = "Madawaska",
+  "Mem" = "Memramcook"
+)
+
+# Add full region names to the dataframe, clean gene names, and remove NA genes
+Results_full <- Results_cleaned %>%
+  mutate(region_full = region_names[region]) %>%
+  # Clean gene names by removing NM identifiers and extract just the gene symbol
+  mutate(Gene_clean = case_when(
+    is.na(Gene) | Gene == "NA" ~ NA_character_,
+    grepl("\\(NM_", Gene) ~ str_extract(Gene, "^[^(]+"),  # Extract part before (NM_)
+    TRUE ~ Gene
+  )) %>%
+  filter(!is.na(Gene_clean) & Gene_clean != "NA" & Gene_clean != "")  # Remove NA values and empty strings
+
+# ============================================================================
+# STATISTICAL TESTING - Chi-square tests for regional independence
+# ============================================================================
+
+# For top genes, perform chi-square tests
+top_genes <- Results_full %>%
+  count(Gene_clean) %>%
+  arrange(desc(n)) %>%
+  head(12) %>%  
+  pull(Gene_clean)
+
+# Perform chi-square test for each top gene
+chi_square_results <- data.frame()
+for (gene in top_genes) {
+  gene_data <- Results_full %>%
+    filter(Gene_clean == gene) %>%
+    count(region_full) %>%
+    complete(region_full = region_names, fill = list(n = 0))
+  
+  # Create contingency table
+  observed <- gene_data$n
+  total <- sum(observed)
+  expected <- rep(total/3, 3)  # Equal distribution expected
+  
+  # Chi-square test
+  test <- chisq.test(observed)
+  
+  chi_square_results <- rbind(chi_square_results, data.frame(
+    Gene = gene,
+    chi_square = test$statistic,
+    p_value = test$p.value,
+    significant = ifelse(test$p.value < 0.05, "Yes", "No")
+  ))
+}
+
+# Print statistical results
+print("Chi-square test results for regional distribution:")
+print(chi_square_results)
+
+# Export statistical results
+write.csv(chi_square_results, "~/Desktop/chi_square_regional_tests.csv", row.names = FALSE)
+
+# ============================================================================
+# PANEL A - Enhanced horizontal bar chart with significance indicators
+# ============================================================================
+
+top_gene_data <- Results_full %>%
+  filter(Gene_clean %in% top_genes) %>%
+  group_by(Gene_clean, region_full) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Gene_clean) %>%
+  mutate(total = sum(count),
+         percentage = count / total * 100) %>%
+  arrange(desc(total), Gene_clean) %>%
+  left_join(chi_square_results, by = c("Gene_clean" = "Gene"))
+
+# Create significance labels
+sig_labels <- chi_square_results %>%
+  arrange(desc(chi_square)) %>%
+  mutate(label = case_when(
+    p_value < 0.001 ~ "***",
+    p_value < 0.01 ~ "**",
+    p_value < 0.05 ~ "*",
+    TRUE ~ "ns"
+  ))
+
+p1 <- ggplot(top_gene_data, aes(x = count, y = reorder(Gene_clean, total), fill = region_full)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +
+  # Add significance stars
+  geom_text(data = sig_labels, 
+            aes(x = Inf, y = Gene, label = label, fill = NULL),
+            hjust = -0.3, size = 5, fontface = "bold") +
+  scale_fill_manual(values = custom_colors, name = "Region") +
+  scale_x_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 5),
+                     limits = c(0, max(top_gene_data$total) * 1.15)) +  # Extra space for stars
+  labs(
+    x = "Variant allele count",
+    y = "Gene",
+    caption = "*** p<0.001, ** p<0.01, * p<0.05, ns = not significant\nChi-square test for regional independence"
+  ) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    legend.margin = margin(t = 15, r = 15, b = 15, l = 20),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.key.width = unit(1.5, "cm"),   
+    legend.key.height = unit(0.8, "cm"), 
+    legend.spacing.y = unit(0.3, "cm"),  
+    plot.margin = margin(25, 35, 10, 10, "pt"),  # Extra right margin for stars
+    plot.caption = element_text(size = 10, hjust = 0, face = "italic")
+  ) +
+  guides(fill = guide_legend(
+    title.position = "top",     
+    title.hjust = 0.5,          
+    label.position = "right",  
+    byrow = TRUE,              
+    override.aes = list(size = 1.2)  
+  ))
+
+print(p1)
+
+# ============================================================================
+# PANEL A-ALT - Grouped bar chart for clearer comparison
+# ============================================================================
+
+p1_alt <- ggplot(top_gene_data, aes(x = reorder(Gene_clean, total), y = percentage, fill = region_full)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  coord_flip() +
+  # Add significance stars
+  geom_text(data = sig_labels, 
+            aes(x = Gene, y = Inf, label = label, fill = NULL),
+            hjust = -0.3, size = 5, fontface = "bold") +
+  scale_fill_manual(values = custom_colors, name = "Region") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 105),
+                     breaks = seq(0, 100, 25)) +
+  labs(
+    x = "Gene",
+    y = "Percentage of variants (%)",
+    caption = "*** p<0.001, ** p<0.01, * p<0.05, ns = not significant\nChi-square test for regional independence"
+  ) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    legend.margin = margin(t = 15, r = 15, b = 15, l = 20),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.key.width = unit(1.5, "cm"),   
+    legend.key.height = unit(0.8, "cm"), 
+    plot.margin = margin(25, 35, 10, 10, "pt"),
+    plot.caption = element_text(size = 10, hjust = 0, face = "italic")
+  )
+
+print(p1_alt)
+
+# ============================================================================
+# PANEL B - Ridge Plot (unchanged but enhanced)
+# ============================================================================
+
+region_profiles <- Results_full %>%
+  group_by(region_full, Gene_clean) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(region_full) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+p2 <- ggplot(region_profiles, aes(x = proportion, y = region_full, fill = region_full)) +
+  geom_density_ridges(scale = 1.5, alpha = 0.8, bandwidth = 0.003) +
+  scale_fill_manual(values = custom_colors) +
+  scale_x_continuous(expand = c(0.01, 0), limits = c(0, 0.15), 
+                     breaks = seq(0, 0.15, 0.03)) +
+  labs(
+    x = "Proportion of total regional expression",
+    y = "Region"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14, family = "Arial"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(color = "gray90", linewidth = 0.3),
+    panel.grid.major.y = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    plot.margin = margin(25, 10, 10, 10, "pt") 
+  )
+
+# ============================================================================
+# PANEL C - Bubble Plot (unchanged)
+# ============================================================================
+
+gene_variation <- Results_full %>%
+  group_by(Gene_clean, region_full) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = region_full, values_from = count, values_fill = 0) %>%
+  rowwise() %>%
+  mutate(
+    total = sum(c_across(where(is.numeric))),
+    variation = sd(c_across(where(is.numeric))) / (mean(c_across(where(is.numeric))) + 0.1)
+  ) %>%
+  ungroup() %>%
+  arrange(desc(variation)) %>%
+  head(12)
+
+region_columns <- c("Acadian Peninsula", "Madawaska", "Restigouche", "Memramcook")
+
+bubble_data <- gene_variation %>%
+  pivot_longer(
+    cols = all_of(region_columns), 
+    names_to = "region_full",
+    values_to = "count"
+  ) %>%
+  mutate(proportion = count / total)
+
+custom_gradient <- colorRampPalette(c("#45B7D1", "#4ECDC4", "#FF6B6B", "purple"))(100)
+
+p3 <- ggplot(bubble_data, aes(x = region_full, y = reorder(Gene_clean, -variation), 
+                              size = count, color = proportion)) +
+  geom_point(alpha = 0.85, stroke = 0.5) +
+  scale_size_continuous(range = c(2, 10), breaks = c(1, 5, 10, 15), 
+                        name = "Count", guide = guide_legend(override.aes = list(alpha = 1))) +
+  scale_color_gradientn(colors = custom_gradient, name = "Proportion",
+                        guide = guide_colorbar(barwidth = 1.2, barheight = 8)) +
+  scale_x_discrete(expand = c(0.1, 0.1)) +
+  labs(
+    x = "Region",
+    y = "Gene"
+  ) +
+  publication_theme +
+  theme(
+    panel.grid.major = element_line(color = "gray95", linewidth = 0.3),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    legend.box = "horizontal",
+    legend.position = "bottom",
+    legend.margin = margin(t = 20, r = 10, b = 15, l = 10),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.box.spacing = unit(1, "cm"),     
+    legend.key.width = unit(1.5, "cm"),     
+    legend.key.height = unit(0.8, "cm"),   
+    legend.spacing.x = unit(0.8, "cm"),     
+    plot.margin = margin(25, 10, 20, 10, "pt")  
+  ) +
+  guides(
+    size = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      label.position = "bottom",
+      override.aes = list(alpha = 1),
+      keywidth = unit(1.2, "cm"),
+      keyheight = unit(0.8, "cm")
+    ),
+    color = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = unit(3, "cm"),    
+      barheight = unit(0.8, "cm"), 
+      label.position = "bottom"
+    )
+  )
+
+# ============================================================================
+# CREATE PIE CHART DATA FOR MAP
+# ============================================================================
+
+# Calculate regional totals for pie charts
+regional_totals <- Results_full %>%
+  group_by(region) %>%
+  summarize(total_variants = n(), .groups = "drop") %>%
+  mutate(region_full = region_names[region])
+
+# For more detailed pie charts, we can show top genes per region
+regional_gene_composition <- Results_full %>%
+  group_by(region, Gene_clean) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(region) %>%
+  mutate(
+    total = sum(count),
+    percentage = count / total * 100,
+    rank = rank(-count, ties.method = "first")
+  ) %>%
+  filter(rank <= 5) %>%  # Top 5 genes per region
+  mutate(region_full = region_names[region])
+
+# Save pie chart data for use in the map script
+write.csv(regional_totals, "~/Desktop/regional_totals_for_map.csv", row.names = FALSE)
+write.csv(regional_gene_composition, "~/Desktop/regional_gene_composition_for_map.csv", row.names = FALSE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+### NEW BRUNSWICK MAP WITH GENE COMPOSITION PIE CHARTS ###
+
+library(scatterpie)  # For pie charts on maps
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(sf)
+library(rnaturalearth)
+library(cowplot)
+
+# Define color palettes
+zone_levels <- as.character(1:7)
+zone_palette <- setNames(c("white", "white", "white", "grey70", "grey70", "grey70", "white"), zone_levels)
+
+# Get Canada map data
+canada <- ne_states(country = "canada", returnclass = "sf")
+new_brunswick <- canada %>% 
+  filter(name == "New Brunswick")
+
+# Read NB health regions
+nb_health_regions <- st_read("/Users/alexboudreau/Downloads/geonb_hr-rs_shp/NBDOH_HealthRegions_Jan2023.shp")
+nb_health_regions <- st_transform(nb_health_regions, st_crs(new_brunswick))
+
+# ============================================================================
+# PREPARE PIE CHART DATA
+# ============================================================================
+
+# Read the regional composition data created in the previous script
+# If files don't exist, create sample data
+if (file.exists("~/Desktop/regional_gene_composition_for_map.csv")) {
+  regional_composition <- read.csv("~/Desktop/regional_gene_composition_for_map.csv")
+} else {
+  # Sample data structure - replace with actual data
+  regional_composition <- data.frame(
+    region = c("Mad", "Mad", "Mad", "Res", "Res", "Res", "Pen", "Pen", "Pen"),
+    Gene_clean = c("LDLR", "APOB", "PCSK9", "LDLR", "APOB", "MYBPC3", "LDLR", "APOB", "TTN"),
+    count = c(15, 8, 5, 12, 10, 6, 14, 9, 7),
+    region_full = c(rep("Madawaska", 3), rep("Restigouche", 3), rep("Acadian Peninsula", 3))
+  )
+}
+
+# Points data with pie chart information
+points <- data.frame(
+  name = c("Restigouche", "Peninsula", "Madawaska", "Memramcook"),
+  region_code = c("Res", "Pen", "Mad", 'Mem'),
+  longitude = c(-66.5, -64.9, -68.3,-64.5),  
+  latitude = c(48.0, 47.7, 47.4, 46.0),
+  n_value = c("n=60", "n=60", "n=60", n="60")
+)
+
+points_sf <- st_as_sf(points, coords = c("longitude", "latitude"), 
+                      crs = st_crs(new_brunswick))
+
+# ============================================================================
+# CREATE PIE CHART OVERLAY DATA
+# ============================================================================
+
+# Prepare data for scatterpie - top 3 genes + "Other"
+pie_for_map <- regional_composition %>%
+  group_by(region) %>%
+  arrange(desc(count)) %>%
+  mutate(
+    category = ifelse(row_number() <= 5, Gene_clean),
+    rank = row_number()
+  ) %>%
+  group_by(region, category) %>%
+  summarize(value = sum(count), .groups = "drop") %>%
+  pivot_wider(names_from = category, values_from = value, values_fill = 0)
+
+# Add coordinates to pie data
+pie_for_map <- pie_for_map %>%
+  left_join(points %>% select(region_code, longitude, latitude), 
+            by = c("region" = "region_code"))
+
+# Get column names that are genes (excluding region, longitude, latitude)
+gene_columns <- setdiff(names(pie_for_map), c("region", "longitude", "latitude"))
+
+# Create color palette for pie charts (genes)
+n_genes <- length(gene_columns)
+gene_colors <- colorRampPalette(c("#E63946", "#F1FAEE", "#A8DADC", "#457B9D", "#1D3557"))(n_genes)
+names(gene_colors) <- gene_columns
+
+# ============================================================================
+# CALCULATE PIE CHART RADIUS FOR ANNOTATION LINE POSITIONING
+# ============================================================================
+
+# Calculate pie chart radius in map coordinates
+# pie_scale in scatterpie is a scaling factor - we'll use 10 for larger pies
+pie_scale_value <- 10
+# Approximate radius calculation - this may need adjustment based on actual rendering
+# The radius in geographic coordinates depends on the plot aspect ratio
+# We'll estimate based on the coordinate system
+pie_radius <- 0.67  # Adjust this value based on visual inspection
+
+# Calculate annotation line endpoints (stop at circle periphery)
+# Calculate annotation line endpoints (stop at circle periphery)
+annotation_data <- data.frame(
+  region = c("Res", "Pen", "Mad", "Mem"),
+  x_center = c(-66.5, -64.9, -68.3, -64.5),  # Added Mem coordinates
+  y_center = c(48.0, 47.7, 47.4, 46.0),      # Added Mem coordinates
+  x_label = c(-66.5 + 0.8, -64.9 + 0.8, -68.3 - 0.8, -64.5 + 0.8),  # Added Mem label position
+  y_label = c(48.0 + 0.5, 47.7 + 0.5, 47.4 + 0.5, 46.0 + 0.5)        # Added Mem label position
+)
+
+# Calculate angle from center to label for each point
+annotation_data <- annotation_data %>%
+  mutate(
+    # Calculate angle
+    angle = atan2(y_label - y_center, x_label - x_center),
+    # Calculate edge point on circle
+    x_edge = x_center + pie_radius * cos(angle),
+    y_edge = y_center + pie_radius * sin(angle)
+  )
+
+# ============================================================================
+# CREATE MAP WITH LARGER PIE CHARTS
+# ============================================================================
+
+nb_map <- ggplot() +
+  geom_sf(data = new_brunswick, fill = "white", color = "black", size = 0.5) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.8, size = 0.5) +
+  scale_fill_manual(values = zone_palette, name = "Zone") +
+  # Add larger pie charts using scatterpie
+  geom_scatterpie(data = pie_for_map, 
+                  aes(x = longitude, y = latitude),
+                  cols = gene_columns,
+                  pie_scale = pie_scale_value,  # Larger pies
+                  alpha = 0.9) +
+  scale_fill_manual(values = gene_colors, name = "Top Genes") +
+  # Add annotation lines that stop at circle edge
+  geom_segment(data = annotation_data, 
+               aes(x = x_edge, 
+                   y = y_edge,
+                   xend = x_label,
+                   yend = y_label),
+               linewidth = 1.0, color = "black") +
+  # Add location labels
+  geom_text(data = annotation_data, 
+            aes(x = x_label,
+                y = y_label,
+                label = c("Restigouche", "Peninsula", "Madawaska", "Memramcook")),
+            size = 7,  
+            hjust = c(0, 0, 1,1),
+            vjust = 0.5,
+            fontface = "bold") +
+  # Add sample size labels
+  geom_text(data = annotation_data, 
+            aes(x = x_label,
+                y = y_label - 0.15,
+                label = c("n=60", "n=60", "n=60", "n=60")),
+            size = 6,  
+            hjust = c(0, 0, 1,1),
+            vjust = 0.5,
+            fontface = "bold") +
+  theme_void() +
+  coord_sf(clip = "off") +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 12),
+    legend.key.size = unit(0.7, "cm"),
+    legend.box.spacing = unit(0.5, "cm"),
+    plot.margin = margin(20, 20, 20, 20),
+    text = element_text(size = 18, color = "black", face = "bold")
+  )
+
+# ============================================================================
+# SAVE FIGURE
+# ============================================================================
+
+ggsave("nb_map_gene_pies.png", 
+       nb_map, 
+       width = 14,
+       height = 12,
+       dpi = 600,
+       bg = "white")
+
+# Display map
+print(nb_map)
+
+# Print pie chart data for verification
+print("Pie chart data:")
+print(pie_for_map)
+
+# Print annotation line data for verification
+print("Annotation line endpoints:")
+print(annotation_data %>% select(region, x_center, y_center, x_edge, y_edge, x_label, y_label))
+
+
+
+
+
+
+
+
+
+# Get top 3 genes per region
+top_genes_per_region <- regional_composition %>%
+  group_by(region) %>%
+  slice_max(count, n = 3) %>%
+  arrange(region, desc(count)) %>%
+  mutate(rank = row_number())
+
+# Add coordinates
+top_genes_per_region <- top_genes_per_region %>%
+  left_join(points %>% select(region_code, longitude, latitude), 
+            by = c("region" = "region_code"))
+
+# Offset positions for the 3 genes
+offset_data <- top_genes_per_region %>%
+  mutate(
+    x_offset = case_when(
+      rank == 1 ~ 0,
+      rank == 2 ~ 0.3,
+      rank == 3 ~ -0.3
+    ),
+    y_offset = case_when(
+      rank == 1 ~ 0.3,
+      rank == 2 ~ -0.15,
+      rank == 3 ~ -0.15
+    ),
+    longitude_adj = longitude + x_offset,
+    latitude_adj = latitude + y_offset
+  )
+
+nb_map_top3 <- ggplot() +
+  geom_sf(data = new_brunswick, fill = "white", color = "black", size = 0.5) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.3, size = 0.5) +
+  scale_fill_manual(values = zone_palette, name = "Zone") +
+  # Add graduated circles for top genes
+  geom_point(data = offset_data,
+             aes(x = longitude_adj, y = latitude_adj, 
+                 size = count, color = Gene_clean),
+             alpha = 0.8, stroke = 1.5) +
+  # Add gene labels
+  geom_text(data = offset_data,
+            aes(x = longitude_adj, y = latitude_adj, label = Gene_clean),
+            size = 4, fontface = "bold", color = "white") +
+  scale_size_continuous(range = c(8, 20), name = "Count") +
+  scale_color_manual(values = gene_colors, name = "Gene") +
+  # Region labels
+  geom_text(data = points,
+            aes(x = longitude, y = latitude + 0.6, label = name),
+            size = 7, fontface = "bold") +
+  theme_void() +
+  coord_sf(clip = "off") +
+  theme(
+    legend.position = "right",
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+ggsave("nb_map_top3_genes.png", nb_map_top3, 
+       width = 14, height = 12, dpi = 600, bg = "white")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Import file
+Memramcook <- read_csv("~/Desktop/Article/Mem.csv")
+
+# Joining all four dataframes into one complete dataframe
+Results <- Madawaska %>%
+  full_join(Restigouche) %>%
+  full_join(Penninsule) %>%
+  full_join(Memramcook)
+
+# Extract gene names and version numbers
+Results$Gene_Name <- gsub("\\s*\\(NM_[0-9]+\\.[0-9]+\\)", "", Results$Gene)
+Results$Version <- as.numeric(gsub(".*\\(NM_[0-9]+\\.([0-9]+)\\)", "\\1", Results$Gene))
+
+# Find the latest version for each gene
+latest_versions <- aggregate(Version ~ Gene_Name, data = Results, max)
+
+# Merge the latest version back to the original data frame
+Results_merged <- merge(Results, latest_versions, by = "Gene_Name", all.x = TRUE)
+
+# Replace older versions with the latest version
+Results_merged$Gene <- with(Results_merged, paste(Gene_Name, "(NM_000018.", Version.y, ")", sep = ""))
+
+# Remove unnecessary columns
+Results_cleaned <- Results_merged[, c("Gene")]
+
+# Read the data from the Excel file
+df <- read_csv("/Users/alexboudreau/Desktop/Article/Book5.csv")
+
+# Clean the column names
+colnames(df) <- c( "Gene", "Base", "Protein", "Frequency_Acadian", "Allele_count_gnomAD", "Allele_number_gnomAD", "Number_of_homozygotes", "Allele_frequency_gnomAD", "Mode_of_transmission",  "Zygosity", "Associated_condition", "Allele_Frequency")
+
+# Convert relevant columns to numeric, setting any problematic values to NA
+df <- df %>%
+  mutate(
+    Frequency_Acadian = as.numeric(Frequency_Acadian),
+    Allele_count_gnomAD = as.numeric(Allele_count_gnomAD),
+    Allele_number_gnomAD = as.numeric(Allele_number_gnomAD),
+    Allele_Frequency = as.numeric(Allele_Frequency),
+    Allele_frequency_gnomAD = as.numeric(Allele_frequency_gnomAD)
+  )
+
+# Remove rows with NA values in relevant columns
+df <- df %>% filter(!is.na(Frequency_Acadian) & !is.na(Allele_count_gnomAD) & !is.na(Allele_number_gnomAD))
+
+# Function to perform one-tailed Fisher's exact test (alternative = "greater")
+fisher_test <- function(frequency_acadian, allele_count_gnomad, allele_number_gnomad) {
+  positive_acadian <- as.numeric(frequency_acadian)
+  negative_acadian <- 360 - as.numeric(frequency_acadian)
+  positive_gnomad <- as.numeric(allele_count_gnomad)
+  negative_gnomad <- as.numeric(allele_number_gnomad) - as.numeric(allele_count_gnomad)
+  
+  # Ensure all values are non-negative
+  if (positive_acadian < 0) positive_acadian <- 0
+  if (negative_acadian < 0) negative_acadian <- 0
+  if (positive_gnomad < 0) positive_gnomad <- 0
+  if (negative_gnomad < 0) negative_gnomad <- 0
+  
+  table <- matrix(c(positive_acadian, negative_acadian, positive_gnomad, negative_gnomad), nrow = 2)
+  test_result <- fisher.test(table, alternative = "greater")
+  return(test_result$p.value)
+}
+
+# Apply Fisher's test to each row
+df$p_value <- mapply(fisher_test, df$Frequency_Acadian, df$Allele_count_gnomAD, df$Allele_number_gnomAD)
+
+# Apply Bonferroni correction
+df$bonferroni_corrected_p <- p.adjust(df$p_value, method = "bonferroni")
+
+# Apply FDR correction
+df$fdr_corrected_p <- p.adjust(df$p_value, method = "BH")
+
+# Filter out rows with Allele_frequency_gnomAD equal to 0 to avoid division by zero
+filtered_df <- df %>%
+  filter(Allele_frequency_gnomAD != 0)
+
+# Calculate the allele frequency ratio
+filtered_df <- filtered_df %>%
+  mutate(allele_frequency_ratio = Allele_Frequency / Allele_frequency_gnomAD)
+
+# Calculate statistics for allele frequency ratios
+allele_freq_stats <- filtered_df %>%
+  summarise(
+    mean_ratio = mean(allele_frequency_ratio, na.rm = TRUE),
+    median_ratio = median(allele_frequency_ratio, na.rm = TRUE),
+    sd_ratio = sd(allele_frequency_ratio, na.rm = TRUE),
+    min_ratio = min(allele_frequency_ratio, na.rm = TRUE),
+    max_ratio = max(allele_frequency_ratio, na.rm = TRUE)
+  )
+
+# Group data by Gene and Base to get unique base counts
+unique_base_counts <- df %>%
+  group_by(Gene, Base) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  summarise(Frequency_Acadian = sum(Frequency_Acadian)) %>%
+  arrange(Frequency_Acadian)
+
+# Threshold line for significance
+threshold_line <- -log10(0.05)
+
+# Add significance flags
+df$Significant_Bonf <- df$bonferroni_corrected_p < 0.05
+df$Significant_Raw  <- df$p_value < 0.05
+
+# Define more variable custom colors for regions
+custom_colors <- c("#E63946", "#06FFA5", "#4361EE", "#F77F00")
+significant_color <- custom_colors[1]  # Using the first color for significant points
+
+# Panel A: Bonferroni-corrected p-values
+plot_A <- ggplot(df, aes(x = Allele_Frequency, y = -log10(bonferroni_corrected_p))) +
+  geom_point(aes(color = Significant_Bonf), alpha = 0.8, size = 3) +
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = significant_color)) +
+  geom_text_repel(
+    data = df[df$Significant_Bonf, ],
+    aes(label = Gene),
+    size = 3.5, fontface = "bold", color = significant_color, max.overlaps = 15
+  ) +
+  geom_hline(yintercept = threshold_line, linetype = "dashed", color = "black", size = 1) +
+  labs(x = "Allele Frequency (gnomAD)",
+       y = expression(bold(-log[10]("Bonferroni-corrected p-value")))) +
+  annotate("text", x = -Inf, y = Inf, label = "A",
+           hjust = -0.8, vjust = 1.5, size = 8, fontface = "bold") +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(face = "bold", color = "black", size = 14),
+    axis.title = element_text(face = "bold", color = "black", size = 16),
+    plot.title = element_text(face = "bold", color = "black", size = 18)
+  )
+
+# Panel B: Raw p-values
+plot_B <- ggplot(df, aes(x = Allele_Frequency, y = -log10(p_value))) +
+  geom_point(aes(color = Significant_Raw), alpha = 0.8, size = 3) +
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = significant_color)) +
+  geom_text_repel(
+    data = df[df$Significant_Raw, ],
+    aes(label = Gene),
+    size = 5, fontface = "bold", color = significant_color, max.overlaps = 15
+  ) +
+  geom_hline(yintercept = threshold_line, linetype = "dashed", color = "black", size = 1) +
+  labs(x = "Allele Frequency (gnomAD)",
+       y = expression(bold(-log[10]("Raw p-value")))) +
+  annotate("text", x = -Inf, y = Inf, label = "B",
+           hjust = -0.8, vjust = 1.5, size = 8, fontface = "bold") +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(face = "bold", color = "black", size = 14),
+    axis.title = element_text(face = "bold", color = "black", size = 16),
+    plot.title = element_text(face = "bold", color = "black", size = 18)
+  )
+
+# Combine with added vertical spacing
+multi_panel_plot <- plot_A / plot_B +
+  plot_layout(heights = c(1, 1)) &
+  theme(plot.margin = margin(15, 15, 30, 15))  
+
+# Save high-resolution PNG
+ggsave("fisher_multipanel_figure.png", multi_panel_plot, width = 8, height = 14, dpi = 600)
+
+
+### SECTION 4 - GENE EXPRESSION BY REGION VISUALIZATION (ENHANCED) ###
+
+# Add region identifier columns to each dataframe before joining
+Penninsule$region <- "Pen"  # Acadian Peninsula
+Restigouche$region <- "Res" # Restigouche
+Madawaska$region <- "Mad"   # Madawaska
+Memramcook$region <- "Mem"
+
+# Joining all four dataframes into one complete dataframe
+Results <- bind_rows(Madawaska, Restigouche, Penninsule, Memramcook)
+
+# Extract gene names and version numbers
+Results$Gene_Name <- gsub("\\s*\\(NM_[0-9]+\\.[0-9]+\\)", "", Results$Gene)
+Results$Version <- as.numeric(gsub(".*\\(NM_[0-9]+\\.([0-9]+)\\)", "\\1", Results$Gene))
+
+# Find the latest version for each gene
+latest_versions <- aggregate(Version ~ Gene_Name, data = Results, max)
+
+# Merge the latest version back to the original data frame
+Results_merged <- merge(Results, latest_versions, by = "Gene_Name", all.x = TRUE)
+
+# Replace older versions with the latest version
+Results_merged$Gene <- with(Results_merged, paste(Gene_Name, "(NM_000018.", Version.y, ")", sep = ""))
+
+# Keep only necessary columns including region information
+Results_cleaned <- Results_merged[, c("Gene", "Gene_Name", "region", "Base", "proteine")]
+
+# Export the merged data with region information
+write.csv(Results_merged, "~/Desktop/Results_merged_with_regions.csv", row.names = FALSE)
+
+#Theme with large fonts and no titles
+publication_theme <- theme_minimal() +
+  theme(
+    # Larger base font sizes for readability at print scale
+    text = element_text(size = 14, family = "Arial"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    legend.title = element_text(size = 13, face = "bold", color = "black"),
+    legend.text = element_text(size = 12, color = "black"),
+    
+    # Clean panel appearance
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.background = element_rect(fill = "white"),
+    
+    # Remove titles for publication
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    
+    # Clean legend with padding
+    legend.position = "right",
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    legend.key = element_rect(fill = "white"),
+    legend.margin = margin(t = 10, r = 10, b = 10, l = 15), 
+    legend.box.margin = margin(t = 5, r = 5, b = 5, l = 5),  
+    legend.key.width = unit(1.2, "cm"),   
+    legend.key.height = unit(0.6, "cm"),  
+    
+    # Margins for proper spacing
+    plot.margin = margin(10, 10, 10, 10, "pt"),
+    
+    # Axis appearance
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.2, "cm")
+  )
+
+# Create a mapping from abbreviated to full region names
+region_names <- c(
+  "Pen" = "Acadian Peninsula",
+  "Res" = "Restigouche",
+  "Mad" = "Madawaska",
+  "Mem" = "Memramcook"
+)
+
+# Add full region names to the dataframe, clean gene names, and remove NA genes
+Results_full <- Results_cleaned %>%
+  mutate(region_full = region_names[region]) %>%
+  # Clean gene names by removing NM identifiers and extract just the gene symbol
+  mutate(Gene_clean = case_when(
+    is.na(Gene) | Gene == "NA" ~ NA_character_,
+    grepl("\\(NM_", Gene) ~ str_extract(Gene, "^[^(]+"),  # Extract part before (NM_)
+    TRUE ~ Gene
+  )) %>%
+  filter(!is.na(Gene_clean) & Gene_clean != "NA" & Gene_clean != "")  # Remove NA values and empty strings
+
+# ============================================================================
+# FILTER FOR SPECIFIC GENES ONLY
+# ============================================================================
+
+# Define the specific genes to include
+target_genes <- c("GALNS", "GJB2", "CPT1A", "USH2A", "TRMU")
+
+# Filter data to only include these genes
+Results_full <- Results_full %>%
+  filter(Gene_clean %in% target_genes)
+
+# ============================================================================
+# STATISTICAL TESTING - Chi-square tests for regional independence
+# ============================================================================
+
+# Perform chi-square test for each target gene
+chi_square_results <- data.frame()
+for (gene in target_genes) {
+  gene_data <- Results_full %>%
+    filter(Gene_clean == gene) %>%
+    count(region_full) %>%
+    complete(region_full = region_names, fill = list(n = 0))
+  
+  # Create contingency table
+  observed <- gene_data$n
+  total <- sum(observed)
+  
+  # Only perform test if there's data
+  if (total > 0) {
+    expected <- rep(total/4, 4)  # Equal distribution expected across 4 regions
+    
+    # Chi-square test
+    test <- chisq.test(observed)
+    
+    chi_square_results <- rbind(chi_square_results, data.frame(
+      Gene = gene,
+      chi_square = test$statistic,
+      p_value = test$p.value,
+      significant = ifelse(test$p.value < 0.05, "Yes", "No")
+    ))
+  }
+}
+
+# Print statistical results
+print("Chi-square test results for regional distribution:")
+print(chi_square_results)
+
+# Export statistical results
+write.csv(chi_square_results, "~/Desktop/chi_square_regional_tests.csv", row.names = FALSE)
+
+# ============================================================================
+# PANEL A - Enhanced horizontal bar chart with significance indicators
+# ============================================================================
+
+target_gene_data <- Results_full %>%
+  filter(Gene_clean %in% target_genes) %>%
+  group_by(Gene_clean, region_full) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Gene_clean) %>%
+  mutate(total = sum(count),
+         percentage = count / total * 100) %>%
+  arrange(desc(total), Gene_clean) %>%
+  left_join(chi_square_results, by = c("Gene_clean" = "Gene"))
+
+# Create significance labels
+sig_labels <- chi_square_results %>%
+  arrange(desc(chi_square)) %>%
+  mutate(label = case_when(
+    p_value < 0.001 ~ "***",
+    p_value < 0.01 ~ "**",
+    p_value < 0.05 ~ "*",
+    TRUE ~ "ns"
+  ))
+
+p1 <- ggplot(target_gene_data, aes(x = count, y = reorder(Gene_clean, total), fill = region_full)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +
+  # Add significance stars
+  geom_text(data = sig_labels, 
+            aes(x = Inf, y = Gene, label = label, fill = NULL),
+            hjust = -0.3, size = 5, fontface = "bold") +
+  scale_fill_manual(values = custom_colors, name = "Region") +
+  scale_x_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 5),
+                     limits = c(0, max(target_gene_data$total) * 1.15)) +  # Extra space for stars
+  labs(
+    x = "Variant allele count",
+    y = "Gene",
+    caption = "*** p<0.001, ** p<0.01, * p<0.05, ns = not significant\nChi-square test for regional independence"
+  ) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    legend.margin = margin(t = 15, r = 15, b = 15, l = 20),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.key.width = unit(1.5, "cm"),   
+    legend.key.height = unit(0.8, "cm"), 
+    legend.spacing.y = unit(0.3, "cm"),  
+    plot.margin = margin(25, 35, 10, 10, "pt"),  # Extra right margin for stars
+    plot.caption = element_text(size = 10, hjust = 0, face = "italic")
+  ) +
+  guides(fill = guide_legend(
+    title.position = "top",     
+    title.hjust = 0.5,          
+    label.position = "right",  
+    byrow = TRUE,              
+    override.aes = list(size = 1.2)  
+  ))
+
+print(p1)
+
+# ============================================================================
+# PANEL A-ALT - Grouped bar chart for clearer comparison
+# ============================================================================
+
+p1_alt <- ggplot(target_gene_data, aes(x = reorder(Gene_clean, total), y = percentage, fill = region_full)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  coord_flip() +
+  # Add significance stars
+  geom_text(data = sig_labels, 
+            aes(x = Gene, y = Inf, label = label, fill = NULL),
+            hjust = -0.3, size = 5, fontface = "bold") +
+  scale_fill_manual(values = custom_colors, name = "Region") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 105),
+                     breaks = seq(0, 100, 25)) +
+  labs(
+    x = "Gene",
+    y = "Percentage of variants (%)",
+    caption = "*** p<0.001, ** p<0.01, * p<0.05, ns = not significant\nChi-square test for regional independence"
+  ) +
+  publication_theme +
+  theme(
+    legend.position = "right",
+    legend.margin = margin(t = 15, r = 15, b = 15, l = 20),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.key.width = unit(1.5, "cm"),   
+    legend.key.height = unit(0.8, "cm"), 
+    plot.margin = margin(25, 35, 10, 10, "pt"),
+    plot.caption = element_text(size = 10, hjust = 0, face = "italic")
+  )
+
+print(p1_alt)
+
+# ============================================================================
+# PANEL B - Ridge Plot
+# ============================================================================
+
+region_profiles <- Results_full %>%
+  group_by(region_full, Gene_clean) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(region_full) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+p2 <- ggplot(region_profiles, aes(x = proportion, y = region_full, fill = region_full)) +
+  geom_density_ridges(scale = 1.5, alpha = 0.8, bandwidth = 0.003) +
+  scale_fill_manual(values = custom_colors) +
+  scale_x_continuous(expand = c(0.01, 0), limits = c(0, 0.15), 
+                     breaks = seq(0, 0.15, 0.03)) +
+  labs(
+    x = "Proportion of total regional expression",
+    y = "Region"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14, family = "Arial"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(color = "gray90", linewidth = 0.3),
+    panel.grid.major.y = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    plot.margin = margin(25, 10, 10, 10, "pt") 
+  )
+
+# ============================================================================
+# PANEL C - Bubble Plot
+# ============================================================================
+
+gene_variation <- Results_full %>%
+  group_by(Gene_clean, region_full) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = region_full, values_from = count, values_fill = 0) %>%
+  rowwise() %>%
+  mutate(
+    total = sum(c_across(where(is.numeric))),
+    variation = sd(c_across(where(is.numeric))) / (mean(c_across(where(is.numeric))) + 0.1)
+  ) %>%
+  ungroup()
+
+region_columns <- c("Acadian Peninsula", "Madawaska", "Restigouche", "Memramcook")
+
+bubble_data <- gene_variation %>%
+  pivot_longer(
+    cols = all_of(region_columns), 
+    names_to = "region_full",
+    values_to = "count"
+  ) %>%
+  mutate(proportion = count / total)
+
+# More variable gradient colors
+custom_gradient <- colorRampPalette(c("#E63946", "#06FFA5", "#4361EE", "#F77F00", "#9B59B6"))(100)
+
+p3 <- ggplot(bubble_data, aes(x = region_full, y = reorder(Gene_clean, -variation), 
+                              size = count, color = proportion)) +
+  geom_point(alpha = 0.85, stroke = 0.5) +
+  scale_size_continuous(range = c(2, 10), breaks = c(1, 5, 10, 15), 
+                        name = "Count", guide = guide_legend(override.aes = list(alpha = 1))) +
+  scale_color_gradientn(colors = custom_gradient, name = "Proportion",
+                        guide = guide_colorbar(barwidth = 1.2, barheight = 8)) +
+  scale_x_discrete(expand = c(0.1, 0.1)) +
+  labs(
+    x = "Region",
+    y = "Gene"
+  ) +
+  publication_theme +
+  theme(
+    panel.grid.major = element_line(color = "gray95", linewidth = 0.3),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    legend.box = "horizontal",
+    legend.position = "bottom",
+    legend.margin = margin(t = 20, r = 10, b = 15, l = 10),  
+    legend.box.margin = margin(t = 10, r = 10, b = 10, l = 10),  
+    legend.box.spacing = unit(1, "cm"),     
+    legend.key.width = unit(1.5, "cm"),     
+    legend.key.height = unit(0.8, "cm"),   
+    legend.spacing.x = unit(0.8, "cm"),     
+    plot.margin = margin(25, 10, 20, 10, "pt")  
+  ) +
+  guides(
+    size = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      label.position = "bottom",
+      override.aes = list(alpha = 1),
+      keywidth = unit(1.2, "cm"),
+      keyheight = unit(0.8, "cm")
+    ),
+    color = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = unit(3, "cm"),    
+      barheight = unit(0.8, "cm"), 
+      label.position = "bottom"
+    )
+  )
+
+# ============================================================================
+# CREATE PIE CHART DATA FOR MAP
+# ============================================================================
+
+# Calculate regional totals for pie charts
+regional_totals <- Results_full %>%
+  group_by(region) %>%
+  summarize(total_variants = n(), .groups = "drop") %>%
+  mutate(region_full = region_names[region])
+
+# Regional gene composition for the 5 target genes
+regional_gene_composition <- Results_full %>%
+  group_by(region, Gene_clean) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(region) %>%
+  mutate(
+    total = sum(count),
+    percentage = count / total * 100
+  ) %>%
+  mutate(region_full = region_names[region])
+
+# Save pie chart data for use in the map script
+write.csv(regional_totals, "~/Desktop/regional_totals_for_map.csv", row.names = FALSE)
+write.csv(regional_gene_composition, "~/Desktop/regional_gene_composition_for_map.csv", row.names = FALSE)
+
+
+### NEW BRUNSWICK MAP WITH GENE COMPOSITION PIE CHARTS ###
+
+library(scatterpie)  # For pie charts on maps
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(sf)
+library(rnaturalearth)
+library(cowplot)
+
+# Define color palettes
+zone_levels <- as.character(1:7)
+zone_palette <- setNames(c("white", "white", "white", "grey70", "grey70", "grey70", "white"), zone_levels)
+
+# Get Canada map data
+canada <- ne_states(country = "canada", returnclass = "sf")
+new_brunswick <- canada %>% 
+  filter(name == "New Brunswick")
+
+# Read NB health regions
+nb_health_regions <- st_read("/Users/alexboudreau/Downloads/geonb_hr-rs_shp/NBDOH_HealthRegions_Jan2023.shp")
+nb_health_regions <- st_transform(nb_health_regions, st_crs(new_brunswick))
+
+# ============================================================================
+# PREPARE PIE CHART DATA
+# ============================================================================
+
+# Read the regional composition data created in the previous script
+if (file.exists("~/Desktop/regional_gene_composition_for_map.csv")) {
+  regional_composition <- read.csv("~/Desktop/regional_gene_composition_for_map.csv")
+} else {
+  # Use the data we just created
+  regional_composition <- regional_gene_composition
+}
+
+# Points data with pie chart information
+points <- data.frame(
+  name = c("Restigouche", "Peninsula", "Madawaska", "Memramcook"),
+  region_code = c("Res", "Pen", "Mad", "Mem"),
+  longitude = c(-66.5, -64.9, -68.3, -64.5),  
+  latitude = c(48.0, 47.7, 47.4, 46.0),
+  n_value = c("n=60", "n=60", "n=60", "n=60")
+)
+
+points_sf <- st_as_sf(points, coords = c("longitude", "latitude"), 
+                      crs = st_crs(new_brunswick))
+
+# ============================================================================
+# CREATE PIE CHART OVERLAY DATA
+# ============================================================================
+
+# Prepare data for scatterpie - all 5 target genes
+pie_for_map <- regional_composition %>%
+  select(region, Gene_clean, count) %>%
+  pivot_wider(names_from = Gene_clean, values_from = count, values_fill = 0)
+
+# Add coordinates to pie data
+pie_for_map <- pie_for_map %>%
+  left_join(points %>% select(region_code, longitude, latitude), 
+            by = c("region" = "region_code"))
+
+# Get column names that are genes (the 5 target genes)
+gene_columns <- target_genes
+
+# Create vibrant color palette for the 5 genes
+gene_colors <- setNames(c("#E63946", "#06FFA5", "#4361EE", "#F77F00", "#9B59B6"), target_genes)
+
+# ============================================================================
+# CALCULATE PIE CHART RADIUS FOR ANNOTATION LINE POSITIONING
+# ============================================================================
+
+# Calculate pie chart radius in map coordinates
+pie_scale_value <- 10
+pie_radius <- 0.67  # Adjust this value based on visual inspection
+
+# Calculate annotation line endpoints
+annotation_data <- data.frame(
+  region = c("Res", "Pen", "Mad", "Mem"),
+  x_center = c(-66.5, -64.9, -68.3, -64.5),
+  y_center = c(48.0, 47.7, 47.4, 46.0),
+  x_label = c(-66.5 + 0.8, -64.9 + 0.8, -68.3 - 0.8, -64.5 + 0.8),
+  y_label = c(48.0 + 0.5, 47.7 + 0.5, 47.4 + 0.5, 46.0 + 0.5)
+)
+
+# Calculate angle from center to label for each point
+annotation_data <- annotation_data %>%
+  mutate(
+    # Calculate angle
+    angle = atan2(y_label - y_center, x_label - x_center),
+    # Calculate edge point on circle
+    x_edge = x_center + pie_radius * cos(angle),
+    y_edge = y_center + pie_radius * sin(angle)
+  )
+
+# ============================================================================
+# CREATE MAP WITH PIE CHARTS
+# ============================================================================
+
+nb_map <- ggplot() +
+  geom_sf(data = new_brunswick, fill = "white", color = "black", size = 0.5) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.8, size = 0.5) +
+  scale_fill_manual(values = zone_palette, name = "Zone") +
+  # Add pie charts using scatterpie
+  geom_scatterpie(data = pie_for_map, 
+                  aes(x = longitude, y = latitude),
+                  cols = gene_columns,
+                  pie_scale = pie_scale_value,
+                  alpha = 0.9) +
+  scale_fill_manual(values = gene_colors, name = "Gene") +
+  # Add annotation lines that stop at circle edge
+  geom_segment(data = annotation_data, 
+               aes(x = x_edge, 
+                   y = y_edge,
+                   xend = x_label,
+                   yend = y_label),
+               linewidth = 1.0, color = "black") +
+  # Add location labels
+  geom_text(data = annotation_data, 
+            aes(x = x_label,
+                y = y_label,
+                label = c("Restigouche", "Peninsula", "Madawaska", "Memramcook")),
+            size = 7,  
+            hjust = c(0, 0, 1, 1),
+            vjust = 0.5,
+            fontface = "bold") +
+  # Add sample size labels
+  geom_text(data = annotation_data, 
+            aes(x = x_label,
+                y = y_label - 0.15,
+                label = c("n=60", "n=60", "n=60", "n=60")),
+            size = 6,  
+            hjust = c(0, 0, 1, 1),
+            vjust = 0.5,
+            fontface = "bold") +
+  theme_void() +
+  coord_sf(clip = "off") +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 12),
+    legend.key.size = unit(0.7, "cm"),
+    legend.box.spacing = unit(0.5, "cm"),
+    plot.margin = margin(20, 20, 20, 20),
+    text = element_text(size = 18, color = "black", face = "bold")
+  )
+
+# ============================================================================
+# SAVE FIGURE
+# ============================================================================
+
+ggsave("nb_map_gene_pies.png", 
+       nb_map, 
+       width = 14,
+       height = 12,
+       dpi = 600,
+       bg = "white")
+
+# Display map
+print(nb_map)
+
+# Print pie chart data for verification
+print("Pie chart data:")
+print(pie_for_map)
+
+# Print annotation line data for verification
+print("Annotation line endpoints:")
+print(annotation_data %>% select(region, x_center, y_center, x_edge, y_edge, x_label, y_label))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Get top 3 genes per region
+top_genes_per_region <- regional_composition %>%
+  group_by(region) %>%
+  slice_max(count, n = 3) %>%
+  arrange(region, desc(count)) %>%
+  mutate(rank = row_number())
+
+# Add coordinates
+top_genes_per_region <- top_genes_per_region %>%
+  left_join(points %>% select(region_code, longitude, latitude), 
+            by = c("region" = "region_code"))
+
+# Offset positions for the 3 genes
+offset_data <- top_genes_per_region %>%
+  mutate(
+    x_offset = case_when(
+      rank == 1 ~ 0,
+      rank == 2 ~ 0.3,
+      rank == 3 ~ -0.3
+    ),
+    y_offset = case_when(
+      rank == 1 ~ 0.3,
+      rank == 2 ~ -0.15,
+      rank == 3 ~ -0.15
+    ),
+    longitude_adj = longitude + x_offset,
+    latitude_adj = latitude + y_offset
+  )
+
+nb_map_top3 <- ggplot() +
+  geom_sf(data = new_brunswick, fill = "white", color = "black", size = 0.5) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.3, size = 0.5) +
+  scale_fill_manual(values = zone_palette, name = "Zone") +
+  # Add graduated circles for top genes
+  geom_point(data = offset_data,
+             aes(x = longitude_adj, y = latitude_adj, 
+                 size = count, color = Gene_clean),
+             alpha = 0.8, stroke = 1.5) +
+  # Add gene labels
+  geom_text(data = offset_data,
+            aes(x = longitude_adj, y = latitude_adj, label = Gene_clean),
+            size = 4, fontface = "bold", color = "white") +
+  scale_size_continuous(range = c(8, 20), name = "Count") +
+  scale_color_manual(values = gene_colors, name = "Gene") +
+  # Region labels
+  geom_text(data = points,
+            aes(x = longitude, y = latitude + 0.6, label = name),
+            size = 7, fontface = "bold") +
+  theme_void() +
+  coord_sf(clip = "off") +
+  theme(
+    legend.position = "right",
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+ggsave("nb_map_top3_genes.png", nb_map_top3, 
+       width = 14, height = 12, dpi = 600, bg = "white")
+
+
+
+
+
+
+
+
+# Version 2: Just legend optimization (suggestion 5)
+nb_map_optimized <- ggplot() +
+  geom_sf(data = new_brunswick, fill = "white", color = "black", size = 0.5) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.3, size = 0.5) +
+  scale_fill_manual(values = zone_palette, 
+                    name = "Zone",
+                    guide = guide_legend(order = 2, nrow = 1)) +
+  # Add graduated circles for top genes
+  geom_point(data = offset_data,
+             aes(x = longitude_adj, y = latitude_adj, 
+                 size = count, color = Gene_clean),
+             alpha = 0.8, stroke = 1.5) +
+  # Add gene labels (remove redundant Gene legend by not showing it)
+  geom_text(data = offset_data,
+            aes(x = longitude_adj, y = latitude_adj, label = Gene_clean),
+            size = 4, fontface = "bold", color = "white") +
+  # Add count labels below circles
+  geom_text(data = offset_data,
+            aes(x = longitude_adj, y = latitude_adj - 0.15, 
+                label = paste0("n=", count)),
+            size = 3, color = "black", fontface = "bold") +
+  scale_size_continuous(range = c(10, 25), 
+                        name = "Sample Count",
+                        guide = guide_legend(order = 1)) +
+  scale_color_manual(values = gene_colors, guide = "none") +  # Remove gene legend
+  # Region labels
+  geom_text(data = points,
+            aes(x = longitude, y = latitude + 0.7, label = name),
+            size = 7, fontface = "bold") +
+  theme_void() +
+  coord_sf(clip = "off") +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.title = element_text(face = "bold", size = 10),
+    legend.text = element_text(size = 9),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, margin = margin(b = 15)),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+# Save both versions
+ggsave("nb_map_pie_version.png", nb_map_pie, 
+       width = 14, height = 12, dpi = 600, bg = "white")
+
+ggsave("nb_map_optimized_legends.png", nb_map_optimized, 
+       width = 14, height = 12, dpi = 600, bg = "white")
