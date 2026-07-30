@@ -1,0 +1,452 @@
+# Load required libraries
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(dplyr)
+library(cowplot)
+library(viridis)
+library(ggrepel)
+library(patchwork)
+
+# Define color palettes
+region_palette <- viridisLite::viridis(7, option = "E")
+province_levels <- c("NB", "NL", "NS", "PE", "QC")
+province_palette <- setNames(region_palette[1:5], province_levels)
+zone_levels <- as.character(1:7)
+zone_palette <- setNames(region_palette, zone_levels)
+
+# =============================================================================
+# PANEL A: MAP
+# =============================================================================
+
+# Get Canada map data
+canada <- ne_states(country = "canada", returnclass = "sf")
+relevant_provinces <- c("New Brunswick", "Nova Scotia", "Prince Edward Island", 
+                        "Québec", "Newfoundland and Labrador")
+main_map_data <- canada %>% 
+  filter(name %in% relevant_provinces)
+new_brunswick <- canada %>% 
+  filter(name == "New Brunswick")
+
+# Read NB health regions (adjust path as needed)
+nb_health_regions <- st_read("/Users/alexboudreau/Downloads/geonb_hr-rs_shp/NBDOH_HealthRegions_Jan2023.shp")
+nb_health_regions <- st_transform(nb_health_regions, st_crs(new_brunswick))
+
+# Points data
+points <- data.frame(
+  name = c("Restigouche", "Acadian Peninsula", "Madawaska"),
+  longitude = c(-66.5, -64.9, -68.3),  
+  latitude = c(48.0, 47.7, 47.4),
+  n_value = c("n=60", "n=60", "n=60")
+)
+points_sf <- st_as_sf(points, coords = c("longitude", "latitude"), 
+                      crs = st_crs(new_brunswick))
+
+# Main map
+main_map <- ggplot() +
+  geom_sf(data = main_map_data, aes(fill = postal), color = "black", size = 0.3) +
+  scale_fill_manual(values = province_palette, name = "") +
+  geom_sf(data = filter(main_map_data, name == "New Brunswick"), 
+          fill = NA, color = "black", linewidth = 1.2) +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.margin = margin(5, 5, 5, 5),
+    text = element_text(size = 12, color = "black", face = "bold")
+  )
+
+
+# Inset map
+inset_map <- ggplot() +
+  geom_sf(data = new_brunswick, fill = "lightgrey", color = "black", size = 0.3) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.6, size = 0.3) +
+  scale_fill_manual(values = zone_palette, name = "Zone") +
+  geom_sf(data = points_sf, color = "black", size = 2.5) +
+  geom_segment(data = points_sf, 
+               aes(x = st_coordinates(geometry)[,1], 
+                   y = st_coordinates(geometry)[,2],
+                   xend = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                   yend = st_coordinates(geometry)[,2] + c(0.3, 0.3, 0.3)),
+               linewidth = 0.4, color = "black") +
+  geom_text(data = points_sf, 
+            aes(x = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                y = st_coordinates(geometry)[,2] + c(0.3, 0.3, 0.3),
+                label = name),
+            size = 3.5, 
+            hjust = c(0, 0, 1),
+            fontface = "bold") +
+  geom_text(data = points_sf, 
+            aes(x = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                y = st_coordinates(geometry)[,2] + c(0.15, 0.15, 0.15),
+                label = n_value),
+            size = 3, 
+            hjust = c(0, 0, 1)) +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.margin = margin(5, 5, 5, 5),
+    text = element_text(size = 12, color = "black", face = "bold")
+  )
+
+
+# Combine maps
+map_combined <- plot_grid(
+  main_map, inset_map,
+  ncol = 2,
+  rel_widths = c(1.3, 1),
+  align = "h"
+)
+
+# Add connection lines
+panel_a <- ggdraw(map_combined) +
+  draw_line(x = c(0.28, 0.62), y = c(0.4, 0.88), 
+            color = "black", linetype = "dashed", size = 0.6) +
+  draw_line(x = c(0.29, 0.64), y = c(0.35, 0.3), 
+            color = "black", linetype = "dashed", size = 0.6)
+
+# =============================================================================
+# PANEL B: SCATTERPLOT
+# =============================================================================
+
+# Prepare scatterplot data
+scatter_data <- df %>%
+  group_by(Gene, Base) %>%
+  summarise(gene_frequency = sum(Frequency_Acadian), .groups = 'drop') %>%
+  group_by(Gene) %>%
+  summarise(
+    allele_count = sum(gene_frequency),
+    unique_variants = n(),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    category = case_when(
+      allele_count > 3 | unique_variants > 2 ~ "Above threshold",
+      TRUE ~ "Below threshold"
+    ),
+    show_label = allele_count > 3 | unique_variants > 2
+  )
+
+# Create scatterplot
+panel_b <- ggplot(scatter_data, aes(x = allele_count, y = unique_variants)) +
+  geom_point(aes(color = category, size = category), alpha = 0.7, 
+             position = position_jitter(width = 0.1, height = 0.1)) +
+  ggrepel::geom_text_repel(
+    data = filter(scatter_data, show_label),
+    aes(label = Gene),
+    size = 3.5,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    segment.color = "gray50",
+    segment.size = 0.4,
+    max.overlaps = 15,
+    force = 2,
+    fontface = "italic"
+  ) +
+  scale_color_manual(
+    values = c("Below threshold" = "gray60", 
+               "Above threshold" = "#2E86AB"),
+    name = "",
+    labels = c("≤3 alleles AND ≤2 variants", ">3 alleles OR >2 variants")
+  ) +
+  scale_size_manual(
+    values = c("Below threshold" = 2, 
+               "Above threshold" = 3.5),
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 6),
+    expand = c(0.05, 0.05)
+  ) +
+  scale_y_continuous(
+    breaks = function(x) seq(floor(min(x)), ceiling(max(x)), by = 1),
+    expand = c(0.05, 0.05)
+  ) +
+  labs(
+    x = "Allele Count",
+    y = "Number of Unique Variants"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(size = 14, color = "black"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 14, color = "black", face = "bold"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    legend.margin = margin(t = 10),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.8),
+    axis.line = element_blank(),
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+  geom_vline(xintercept = 3, linetype = "dashed", color = "gray50", alpha = 0.7, size = 0.6) +
+  geom_hline(yintercept = 2, linetype = "dashed", color = "gray50", alpha = 0.7, size = 0.6)
+
+# =============================================================================
+# COMBINE PANELS
+# =============================================================================
+
+# Create final two-panel figure
+final_figure <- plot_grid(
+  panel_a, panel_b,
+  ncol = 2,
+  rel_widths = c(1, 1),
+  labels = c("A", "B"),
+  label_size = 18,
+  label_fontface = "bold",
+  hjust = -0.1,
+  vjust = 1.1
+)
+
+
+# Alternative layout (stacked vertically if preferred)
+final_figure_vertical <- plot_grid(
+  panel_a, panel_b,
+  ncol = 1,
+  rel_heights = c(1, 1.2),
+  labels = c("A", "B"),
+  label_size = 18,
+  label_fontface = "bold",
+  hjust = -0.1,
+  vjust = 1.1
+)
+
+ggsave("publication_figure_two_panel_vertical.png", 
+       final_figure_vertical, 
+       width = 16, 
+       height = 14, 
+       dpi = 600,
+       bg = "white")
+
+
+
+
+
+
+
+
+
+# Load required libraries
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(dplyr)
+library(cowplot)
+library(viridis)
+library(ggrepel)
+library(patchwork)
+
+# Define color palettes
+region_palette <- viridisLite::viridis(7, option = "E")
+province_levels <- c("NB", "NL", "NS", "PE", "QC")
+province_palette <- setNames(region_palette[1:5], province_levels)
+zone_levels <- as.character(1:7)
+zone_palette <- setNames(region_palette, zone_levels)
+
+# =============================================================================
+# PANEL A: MAP
+# =============================================================================
+
+# Get Canada map data
+canada <- ne_states(country = "canada", returnclass = "sf")
+relevant_provinces <- c("New Brunswick", "Nova Scotia", "Prince Edward Island", 
+                        "Québec", "Newfoundland and Labrador")
+main_map_data <- canada %>% 
+  filter(name %in% relevant_provinces)
+new_brunswick <- canada %>% 
+  filter(name == "New Brunswick")
+
+# Read NB health regions (adjust path as needed)
+nb_health_regions <- st_read("/Users/alexboudreau/Downloads/geonb_hr-rs_shp/NBDOH_HealthRegions_Jan2023.shp")
+nb_health_regions <- st_transform(nb_health_regions, st_crs(new_brunswick))
+
+# Points data
+points <- data.frame(
+  name = c("Restigouche", "Acadian Peninsula", "Madawaska"),
+  longitude = c(-66.5, -64.9, -68.3),  
+  latitude = c(48.0, 47.7, 47.4),
+  n_value = c("n=60", "n=60", "n=60")
+)
+points_sf <- st_as_sf(points, coords = c("longitude", "latitude"), 
+                      crs = st_crs(new_brunswick))
+
+# Main map
+main_map <- ggplot() +
+  geom_sf(data = main_map_data, aes(fill = postal), color = "black", size = 0.3) +
+  scale_fill_manual(values = province_palette, name = "") +
+  geom_sf(data = filter(main_map_data, name == "New Brunswick"), 
+          fill = NA, color = "black", linewidth = 1.2) +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.margin = margin(5, 5, 5, 5),
+    text = element_text(size = 12, color = "black", face = "bold")
+  )
+
+# Inset map
+inset_map <- ggplot() +
+  geom_sf(data = new_brunswick, fill = "lightgrey", color = "black", size = 0.3) +
+  geom_sf(data = nb_health_regions, aes(fill = Region), color = "black", 
+          alpha = 0.6, size = 0.3) +
+  scale_fill_manual(values = zone_palette, name = "Zone") +
+  geom_sf(data = points_sf, color = "black", size = 2.5) +
+  geom_segment(data = points_sf, 
+               aes(x = st_coordinates(geometry)[,1], 
+                   y = st_coordinates(geometry)[,2],
+                   xend = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                   yend = st_coordinates(geometry)[,2] + c(0.3, 0.3, 0.3)),
+               linewidth = 0.4, color = "black") +
+  geom_text(data = points_sf, 
+            aes(x = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                y = st_coordinates(geometry)[,2] + c(0.3, 0.3, 0.3),
+                label = name),
+            size = 3.5, 
+            hjust = c(0, 0, 1),
+            fontface = "bold") +
+  geom_text(data = points_sf, 
+            aes(x = st_coordinates(geometry)[,1] + c(0.5, 0.5, -0.5),
+                y = st_coordinates(geometry)[,2] + c(0.15, 0.15, 0.15),
+                label = n_value),
+            size = 3, 
+            hjust = c(0, 0, 1),
+            fontface = "bold") +
+  theme_void() +
+  coord_sf(clip = "off") +
+  theme(
+    legend.position = "none",
+    plot.margin = margin(5, 5, 5, 5),
+    text = element_text(size = 12, color = "black", face = "bold")
+  )
+
+# Combine maps
+map_combined <- plot_grid(
+  main_map, inset_map,
+  ncol = 2,
+  rel_widths = c(1.3, 1),
+  align = "h"
+)
+
+# Add connection lines
+panel_a <- ggdraw(map_combined) +
+  draw_line(x = c(0.28, 0.62), y = c(0.4, 0.88), 
+            color = "black", linetype = "dashed", size = 0.6) +
+  draw_line(x = c(0.29, 0.64), y = c(0.35, 0.3), 
+            color = "black", linetype = "dashed", size = 0.6)
+
+# =============================================================================
+# PANEL B: SCATTERPLOT
+# =============================================================================
+
+# Prepare scatterplot data (assuming 'df' exists with your genetic data)
+scatter_data <- df %>%
+  group_by(Gene, Base) %>%
+  summarise(gene_frequency = sum(Frequency_Acadian), .groups = 'drop') %>%
+  group_by(Gene) %>%
+  summarise(
+    allele_count = sum(gene_frequency),
+    unique_variants = n(),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    category = case_when(
+      allele_count > 3 | unique_variants > 2 ~ "Above threshold",
+      TRUE ~ "Below threshold"
+    ),
+    show_label = allele_count > 3 | unique_variants > 2
+  )
+
+# Create scatterplot
+panel_b <- ggplot(scatter_data, aes(x = allele_count, y = unique_variants)) +
+  geom_point(aes(color = category, size = category), alpha = 0.7, 
+             position = position_jitter(width = 0.1, height = 0.1)) +
+  ggrepel::geom_text_repel(
+    data = filter(scatter_data, show_label),
+    aes(label = Gene),
+    size = 3.5,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    segment.color = "gray50",
+    segment.size = 0.4,
+    max.overlaps = 15,
+    force = 2,
+    fontface = "bold"
+  ) +
+  scale_color_manual(
+    values = c("Below threshold" = "gray60", 
+               "Above threshold" = "#2E86AB"),
+    name = "",
+    labels = c("≤3 alleles AND ≤2 variants", ">3 alleles OR >2 variants")
+  ) +
+  scale_size_manual(
+    values = c("Below threshold" = 2, 
+               "Above threshold" = 3.5),
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 6),
+    expand = c(0.05, 0.05)
+  ) +
+  scale_y_continuous(
+    breaks = function(x) seq(floor(min(x)), ceiling(max(x)), by = 1),
+    expand = c(0.05, 0.05)
+  ) +
+  labs(
+    x = "Allele Count",
+    y = "Number of Unique Variants"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(size = 14, color = "black", face = "bold"),
+    axis.text = element_text(size = 12, color = "black", face = "bold"),
+    axis.title = element_text(size = 14, color = "black", face = "bold"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 12, face = "bold"),
+    legend.margin = margin(t = 10),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.8),
+    axis.line = element_blank(),
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+  geom_vline(xintercept = 3, linetype = "dashed", color = "gray50", alpha = 0.7, size = 0.6) +
+  geom_hline(yintercept = 2, linetype = "dashed", color = "gray50", alpha = 0.7, size = 0.6)
+
+# =============================================================================
+# COMBINE PANELS
+# =============================================================================
+
+# Create final two-panel figure
+final_figure <- plot_grid(
+  panel_a, panel_b,
+  ncol = 2,
+  rel_widths = c(1, 1),
+  labels = c("A", "B"),
+  label_size = 18,
+  label_fontface = "bold",
+  hjust = -0.1,
+  vjust = 1.1
+)
+
+# Alternative layout (stacked vertically if preferred)
+final_figure_vertical <- plot_grid(
+  panel_a, panel_b,
+  ncol = 1,
+  rel_heights = c(1, 1.2),
+  labels = c("A", "B"),
+  label_size = 18,
+  label_fontface = "bold",
+  hjust = -0.1,
+  vjust = 1.1
+)
+
+ggsave("publication_figure_two_panel_vertical.png", 
+       final_figure_vertical, 
+       width = 16, 
+       height = 14, 
+       dpi = 600,
+       bg = "white")
+
+
+# Display the figure
+print(final_figure_vertical)
+
+
