@@ -1,0 +1,397 @@
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggrepel)
+library(viridisLite)
+library(gridExtra)
+library(grid)  # For textGrob
+
+# Function to calculate Jeffreys confidence interval for binomial proportion
+calculate_jeffreys_ci <- function(x, n, alpha = 0.05) {
+  # x = number of successes (variant allele count)
+  # n = total number of trials (total allele count)
+  # alpha = significance level
+  
+  # Jeffreys interval uses Beta distribution with parameters (x + 0.5, n - x + 0.5)
+  lower <- qbeta(alpha/2, x + 0.5, n - x + 0.5)
+  upper <- qbeta(1 - alpha/2, x + 0.5, n - x + 0.5)
+  
+  return(c(lower = lower, upper = upper))
+}
+
+# Apply to your dataframe
+df <- df %>%
+  mutate(
+    # For Acadian data - assuming 360 is your total allele count
+    ci_lower_acadian = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Frequency_Acadian[i], 360)[1]),
+    ci_upper_acadian = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Frequency_Acadian[i], 360)[2]),
+    
+    # For gnomAD data
+    ci_lower_gnomad = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Allele_count_gnomAD[i], df$Allele_number_gnomAD[i])[1]),
+    ci_upper_gnomad = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Allele_count_gnomAD[i], df$Allele_number_gnomAD[i])[2])
+  )
+
+# Select some interesting genes to visualize
+genes_to_plot <- df %>%
+  filter(p_value < 0.05) %>%  # Filter for significant genes
+  arrange(p_value) %>%        # Sort by p-value
+  head(10) %>%                # Take top 10
+  pull(Gene)                  # Extract gene names
+
+# Create data for plotting confidence intervals
+ci_plot_data <- df %>%
+  filter(Gene %in% genes_to_plot) %>%
+  select(Gene, Allele_Frequency, Allele_frequency_gnomAD, 
+         ci_lower_acadian, ci_upper_acadian, 
+         ci_lower_gnomad, ci_upper_gnomad) %>%
+  # Reshape to long format for easier plotting
+  pivot_longer(
+    cols = c(Allele_Frequency, Allele_frequency_gnomAD),
+    names_to = "Population",
+    values_to = "Frequency"
+  ) %>%
+  mutate(
+    Population = ifelse(Population == "Allele_Frequency", "Acadian", "gnomAD NFE"),
+    Lower_CI = ifelse(Population == "Acadian", ci_lower_acadian, ci_lower_gnomad),
+    Upper_CI = ifelse(Population == "Acadian", ci_upper_acadian, ci_upper_gnomad)
+  )
+
+# Generate the 'E' palette with as many colors as you have populations
+population_colors <- viridisLite::viridis(n = length(unique(ci_plot_data$Population)), option = "E")
+
+# Panel A: Confidence interval plot
+panel_a <- ggplot(ci_plot_data, aes(x = Gene, y = Frequency, color = Population)) +
+  geom_point(position = position_dodge(width = 0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI), 
+                position = position_dodge(width = 0.5), width = 0.2, linewidth = 0.6) +
+  coord_flip() +
+  labs(x = "Gene",
+       y = "Allele Frequency") +
+  scale_color_manual(values = population_colors) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 12, color = "black", face = "bold"),
+    axis.title.y = element_text(size = 12, color = "black", face = "bold"),
+    axis.text.x = element_text(size = 10, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+    legend.title = element_text(size = 11, color = "black", face = "bold"),
+    legend.text = element_text(size = 10, color = "black", face = "bold"),
+    legend.position = "bottom",
+    legend.margin = margin(t = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.background = element_rect(fill = "white", color = "black", linewidth = 0.5),  # ✅ Border around each plot
+    plot.background = element_rect(fill = "white", color = NA),                         # ❌ No outer panel border
+    plot.margin = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.15, "cm")
+  )
+
+
+# Calculate the Bonferroni significance threshold
+total_variants_tested <- nrow(df)
+bonferroni_threshold <- 0.05 / total_variants_tested
+neg_log10_threshold <- -log10(bonferroni_threshold)
+
+# Panel B: Volcano/Manhattan plot with Bonferroni correction
+panel_b <- ggplot(df, aes(x = Allele_Frequency, y = -log10(p_value))) +
+  xlim(0, 0.013) +  # ✅ Trim white space beyond 0.02
+  # Plot all variants as gray points
+  geom_point(color = "gray70", alpha = 0.7, size = 1.5) +
+  # Highlight significant variants with viridis color palette (option E)
+  geom_point(data = df %>% filter(bonferroni_corrected_p < 0.05), 
+             aes(color = -log10(p_value)), size = 2.5) +
+  scale_color_viridis_c(option = "E", direction = -1, name = "-log₁₀(p)") +
+  # Add labels to significant variants
+  geom_text_repel(
+    data = df %>% filter(bonferroni_corrected_p < 0.05),
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 15,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    fontface = "bold"  # ✅ Forces bold text
+  )+
+  # Add horizontal line for Bonferroni significance threshold
+  geom_hline(yintercept = neg_log10_threshold, linetype = "dashed", 
+             color = "red", linewidth = 0.6) +
+  # Add annotation for the threshold
+  annotate("text", x = max(df$Allele_Frequency, na.rm = TRUE) * 0.95, 
+           y = neg_log10_threshold * 1.15, 
+           label = paste("Bonferroni\nthreshold"), 
+           color = "red", hjust = 1, size = 3.5, fontface = "italic") +
+  labs(x = "Allele Frequency",
+       y = "-log₁₀(p-value)") +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 12, color = "black", face = "bold"),
+    axis.title.y = element_text(size = 12, color = "black", face = "bold"),
+    axis.text.x = element_text(size = 10, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+    legend.title = element_text(size = 11, color = "black", face = "bold"),
+    legend.text = element_text(size = 10, color = "black", face = "bold"),
+    legend.position = "bottom",
+    legend.margin = margin(t = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.background = element_rect(fill = "white", color = "black", linewidth = 0.5),  # ✅ Border around each plot
+    plot.background = element_rect(fill = "white", color = NA),                         # ❌ No outer panel border
+    plot.margin = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.15, "cm")
+  )
+
+
+# Create panel labels as annotations within each plot
+panel_a <- panel_a + 
+  annotation_custom(textGrob("A", x = 0.02, y = 0.98, 
+                             gp = gpar(fontsize = 16, fontface = "bold")))
+
+panel_b <- panel_b + 
+  annotation_custom(textGrob("B", x = 0.02, y = 0.98, 
+                             gp = gpar(fontsize = 16, fontface = "bold")))
+
+# Create the final multiplot with proper spacing
+publication_multiplot <- arrangeGrob(
+  panel_a,
+  panel_b,
+  ncol = 1,
+  nrow = 2,
+  heights = c(1, 1),
+  padding = unit(0, "cm")  # Remove padding between panels
+)
+
+# Display the plot
+grid.draw(publication_multiplot)
+
+ggsave("genetic_variants_multiplot.png", 
+       plot = publication_multiplot,
+       width = 10,        # ✅ Same as above
+       height = 12,
+       dpi = 600,
+       bg = "white")
+
+# Alternative: save as TIFF (often preferred for publication)
+ggsave("genetic_variants_multiplot.tiff", 
+       plot = publication_multiplot,
+       width = 10,
+       height = 12,
+       dpi = 600,
+       bg = "white",
+       compression = "lzw")
+
+# Alternative: save as PDF (vector format, scales perfectly)
+ggsave("genetic_variants_multiplot.pdf", 
+       plot = publication_multiplot,
+       width = 10,
+       height = 12,
+       bg = "white")
+
+# Print information about the plot
+cat("Publication-quality multiplot created with:\n")
+cat("- Panel A: Allele frequencies with 95% confidence intervals\n")
+cat("- Panel B: Significance plot with Bonferroni correction\n")
+cat("- 600 DPI resolution\n")
+cat("- Files saved as PNG, TIFF, and PDF formats\n")
+cat("- Font sizes optimized for publication (10-12pt)\n")
+cat("- Clean, minimal theme with proper axis formatting\n")
+
+
+
+
+
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggrepel)
+library(viridisLite)
+library(gridExtra)
+library(grid)  # For textGrob
+
+# Function to calculate Jeffreys confidence interval for binomial proportion
+calculate_jeffreys_ci <- function(x, n, alpha = 0.05) {
+  # x = number of successes (variant allele count)
+  # n = total number of trials (total allele count)
+  # alpha = significance level
+  
+  # Jeffreys interval uses Beta distribution with parameters (x + 0.5, n - x + 0.5)
+  lower <- qbeta(alpha/2, x + 0.5, n - x + 0.5)
+  upper <- qbeta(1 - alpha/2, x + 0.5, n - x + 0.5)
+  
+  return(c(lower = lower, upper = upper))
+}
+
+# Apply to your dataframe
+df <- df %>%
+  mutate(
+    # For Acadian data - assuming 360 is your total allele count
+    ci_lower_acadian = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Frequency_Acadian[i], 360)[1]),
+    ci_upper_acadian = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Frequency_Acadian[i], 360)[2]),
+    
+    # For gnomAD data
+    ci_lower_gnomad = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Allele_count_gnomAD[i], df$Allele_number_gnomAD[i])[1]),
+    ci_upper_gnomad = sapply(1:nrow(df), function(i) 
+      calculate_jeffreys_ci(df$Allele_count_gnomAD[i], df$Allele_number_gnomAD[i])[2])
+  )
+
+# Select some interesting genes to visualize
+genes_to_plot <- df %>%
+  filter(p_value < 0.05) %>%  # Filter for significant genes
+  arrange(p_value) %>%        # Sort by p-value
+  head(10) %>%                # Take top 10
+  pull(Gene)                  # Extract gene names
+
+# Create data for plotting confidence intervals
+ci_plot_data <- df %>%
+  filter(Gene %in% genes_to_plot) %>%
+  select(Gene, Allele_Frequency, Allele_frequency_gnomAD, 
+         ci_lower_acadian, ci_upper_acadian, 
+         ci_lower_gnomad, ci_upper_gnomad) %>%
+  # Reshape to long format for easier plotting
+  pivot_longer(
+    cols = c(Allele_Frequency, Allele_frequency_gnomAD),
+    names_to = "Population",
+    values_to = "Frequency"
+  ) %>%
+  mutate(
+    Population = ifelse(Population == "Allele_Frequency", "Acadian", "gnomAD NFE"),
+    Lower_CI = ifelse(Population == "Acadian", ci_lower_acadian, ci_lower_gnomad),
+    Upper_CI = ifelse(Population == "Acadian", ci_upper_acadian, ci_upper_gnomad)
+  )
+
+# Generate the 'E' palette with as many colors as you have populations
+population_colors <- viridisLite::viridis(n = length(unique(ci_plot_data$Population)), option = "E")
+
+# Panel A: Confidence interval plot with improved legend padding
+panel_a <- ggplot(ci_plot_data, aes(x = Gene, y = Frequency, color = Population)) +
+  geom_point(position = position_dodge(width = 0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI), 
+                position = position_dodge(width = 0.5), width = 0.2, linewidth = 0.6) +
+  coord_flip() +
+  labs(x = "Gene",
+       y = "Allele Frequency") +
+  scale_color_manual(values = population_colors) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 12, color = "black", face = "bold"),
+    axis.title.y = element_text(size = 12, color = "black", face = "bold"),
+    axis.text.x = element_text(size = 10, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+    legend.title = element_text(size = 11, color = "black", face = "bold"),
+    legend.text = element_text(size = 10, color = "black", face = "bold"),
+    legend.position = "bottom",
+    legend.margin = margin(t = 15, b = 5, l = 5, r = 5),  # More space around legend
+    legend.box.margin = margin(t = 10, b = 10, l = 10, r = 10),  # Margin around legend box
+    legend.box.spacing = unit(0.5, "cm"),  # Space between legend elements
+    legend.key.width = unit(1.2, "cm"),  # Wider legend keys
+    legend.key.height = unit(0.5, "cm"),  # Taller legend keys
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(t = 10, r = 20, b = 20, l = 10),  # More bottom margin for legend
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.15, "cm")
+  ) +
+  guides(color = guide_legend(
+    title.position = "top",  # Position title above legend
+    title.hjust = 0.5,       # Center the title
+    label.position = "right", # Position labels to the right of symbols
+    byrow = TRUE,            # Arrange legend items in rows
+    override.aes = list(size = 3)  # Make legend symbols slightly larger
+  ))
+
+# Calculate the Bonferroni significance threshold
+total_variants_tested <- nrow(df)
+bonferroni_threshold <- 0.05 / total_variants_tested
+neg_log10_threshold <- -log10(bonferroni_threshold)
+
+# Panel B: Volcano/Manhattan plot with Bonferroni correction
+panel_b <- ggplot(df, aes(x = Allele_Frequency, y = -log10(p_value))) +
+  xlim(0, 0.013) +  # ✅ Trim white space beyond 0.02
+  # Plot all variants as gray points
+  geom_point(color = "gray70", alpha = 0.7, size = 1.5) +
+  # Highlight significant variants with viridis color palette (option E)
+  geom_point(data = df %>% filter(bonferroni_corrected_p < 0.05), 
+             aes(color = -log10(p_value)), size = 2.5) +
+  scale_color_viridis_c(option = "E", direction = -1, name = "-log₁₀(p)") +
+  # Add labels to significant variants
+  geom_text_repel(
+    data = df %>% filter(bonferroni_corrected_p < 0.05),
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 15,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    fontface = "bold"  # ✅ Forces bold text
+  )+
+  # Add horizontal line for Bonferroni significance threshold
+  geom_hline(yintercept = neg_log10_threshold, linetype = "dashed", 
+             color = "red", linewidth = 0.6) +
+  # Add annotation for the threshold
+  annotate("text", x = max(df$Allele_Frequency, na.rm = TRUE) * 0.95, 
+           y = neg_log10_threshold * 1.15, 
+           label = paste("Bonferroni\nthreshold"), 
+           color = "red", hjust = 1, size = 3.5, fontface = "italic") +
+  labs(x = "Allele Frequency",
+       y = "-log₁₀(p-value)") +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 12, color = "black", face = "bold"),
+    axis.title.y = element_text(size = 12, color = "black", face = "bold"),
+    axis.text.x = element_text(size = 10, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+    legend.title = element_text(size = 11, color = "black", face = "bold"),
+    legend.text = element_text(size = 10, color = "black", face = "bold"),
+    legend.position = "bottom",
+    legend.margin = margin(t = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    panel.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.15, "cm")
+  )
+
+# Create panel labels as annotations within each plot
+panel_a <- panel_a + 
+  annotation_custom(textGrob("A", x = 0.02, y = 0.98, 
+                             gp = gpar(fontsize = 16, fontface = "bold")))
+
+panel_b <- panel_b + 
+  annotation_custom(textGrob("B", x = 0.02, y = 0.98, 
+                             gp = gpar(fontsize = 16, fontface = "bold")))
+
+# Create the final multiplot with proper spacing
+publication_multiplot <- arrangeGrob(
+  panel_a,
+  panel_b,
+  ncol = 1,
+  nrow = 2,
+  heights = c(1, 1),
+  padding = unit(0, "cm")  # Remove padding between panels
+)
+
+# Display the plot
+grid.draw(publication_multiplot)
+
+ggsave("genetic_variants_multiplot.png", 
+       plot = publication_multiplot,
+       width = 10,        # ✅ Same as above
+       height = 12,
+       dpi = 600,
+       bg = "white")
